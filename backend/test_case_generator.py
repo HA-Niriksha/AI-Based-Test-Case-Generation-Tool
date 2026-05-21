@@ -14,12 +14,86 @@ from config import DEDUP_THRESHOLD
 
 logger = logging.getLogger(__name__)
 
+# ─── MODAL VERB CLEANER ───────────────────────────────────────────────────────
+
+# Modal verbs that should NOT appear in test case descriptions / objectives
+_MODAL_PATTERN = re.compile(
+    r'\b(shall|should|must|may|can|will|would|could|might)\s+',
+    re.IGNORECASE
+)
+
+def _clean_modal(text: str) -> str:
+    """
+    Removes modal verbs (shall, must, should, can, will, may) from a phrase.
+    Used to produce clean, professional test case objectives and step descriptions.
+
+    Examples:
+      "shall allow users to login"  → "allow users to login"
+      "must validate credentials"   → "validate credentials"
+      "can display the dashboard"   → "display the dashboard"
+    """
+    cleaned = _MODAL_PATTERN.sub('', text).strip()
+    # Capitalise first letter
+    return cleaned[0].upper() + cleaned[1:] if cleaned else text
+
+# ─── REQUIREMENT SIGNAL FILTER ───────────────────────────────────────────────
+# Only sentences containing these keywords are treated as actual requirements.
+# Everything else (headings, descriptions, notes, references) is skipped.
+
+_REQ_SIGNALS = re.compile(
+    r'\b(shall|must|should|will not|shall not|must not|'
+    r'allow|enable|prevent|restrict|validate|calculate|'
+    r'display|render|show|submit|process|return|create|update|delete|'
+    r'search|filter|sort|authenticate|authorise|authorize|'
+    r'notify|generate|export|import|upload|download|'
+    r'verify|confirm|reject|approve|support|provide|ensure|'
+    r'detect|monitor|log|record|send|receive|assign|track|'
+    r'handle|manage|store|retrieve|compute|enforce|require|'
+    r'permit|forbid|encrypt|hash|mask|redirect|trigger)\b',
+    re.IGNORECASE
+)
+
+def _is_requirement_sentence(sentence: str) -> bool:
+    """
+    Returns True only if the sentence contains requirement-indicating language.
+    Filters out: headings, descriptions, notes, references, page numbers,
+    table headers, introductory paragraphs, and pure nouns/labels.
+    """
+    s = sentence.strip()
+    # Too short to be a requirement
+    if len(s.split()) < 5:
+        return False
+    # Looks like a heading (ends with colon, no verb)
+    if s.endswith(':'):
+        return False
+    # Looks like a page number or reference code only
+    if re.match(r'^[\d\.\s]+$', s):
+        return False
+    # Must contain at least one requirement signal word
+    return bool(_REQ_SIGNALS.search(s))
+
 # ─── NLP SETUP ───────────────────────────────────────────────────────────────
 
 _NLP = None
 
 def get_nlp():
-    return None  # use regex fallback — no spaCy dependency
+    global _NLP
+    if _NLP is not None:
+        return _NLP
+    try:
+        import spacy
+        _NLP = spacy.load("en_core_web_sm", disable=["ner", "lemmatizer"])
+        logger.info("spaCy en_core_web_sm loaded")
+    except Exception:
+        try:
+            from spacy.lang.en import English
+            _NLP = English()
+            _NLP.add_pipe("sentencizer")
+            logger.info("spaCy blank English + sentencizer loaded")
+        except Exception:
+            _NLP = None
+            logger.warning("spaCy not available — falling back to regex sentence splitting")
+    return _NLP
 
 
 def is_spacy_available() -> bool:
@@ -33,20 +107,37 @@ def is_spacy_available() -> bool:
 # ─── SENTENCE EXTRACTION ─────────────────────────────────────────────────────
 
 def extract_requirement_sentences(text: str) -> List[str]:
+    """
+    Splits text into sentences and returns ONLY sentences that contain
+    actual requirement language (shall, must, should, allow, validate, etc.).
+    Skips headings, notes, descriptions, references, and general prose.
+    """
     nlp = get_nlp()
     if nlp is not None:
-        doc = nlp(text)
-        sentences = [sent.text.strip() for sent in doc.sents]
+        try:
+            doc = nlp(text)
+            raw_sentences = [sent.text.strip() for sent in doc.sents]
+        except Exception:
+            raw_sentences = re.split(r'(?<=[.!?])\s+', text)
     else:
-        sentences = re.split(r'(?<=[.!?])\s+', text)
+        raw_sentences = re.split(r'(?<=[.!?])\s+', text)
 
-    filtered = []
-    for s in sentences:
-        s = s.strip()
-        word_count = len(s.split())
-        if word_count >= 8:
-            filtered.append(s)
-    return filtered if filtered else [text[:500]]
+    # Filter 1: only sentences with requirement signal words
+    req_sentences = [s.strip() for s in raw_sentences if _is_requirement_sentence(s.strip())]
+
+    # Filter 2: deduplicate exact matches
+    seen, unique = set(), []
+    for s in req_sentences:
+        if s.lower() not in seen:
+            seen.add(s.lower())
+            unique.append(s)
+
+    # Fallback: if the filter removed everything (e.g. the whole block is
+    # one long sentence), return any sentence with minimum length
+    if not unique:
+        unique = [s.strip() for s in raw_sentences if len(s.split()) >= 5]
+
+    return unique if unique else [text[:500]]
 
 
 # ─── SUBJECT / ACTION EXTRACTION ─────────────────────────────────────────────
@@ -54,43 +145,55 @@ def extract_requirement_sentences(text: str) -> List[str]:
 def extract_subject(sentence: str) -> str:
     nlp = get_nlp()
     if nlp is not None:
-        doc = nlp(sentence)
-        # Try dependency parse for subject
-        for chunk in doc.noun_chunks:
-            if chunk.root.dep_ in ("nsubj", "nsubjpass"):
+        try:
+            doc = nlp(sentence)
+            for chunk in doc.noun_chunks:
+                if chunk.root.dep_ in ("nsubj", "nsubjpass"):
+                    return chunk.text.strip()
+            for chunk in doc.noun_chunks:
                 return chunk.text.strip()
-        # Fall back to first noun chunk
-        for chunk in doc.noun_chunks:
-            return chunk.text.strip()
-    # Regex fallback: look for "the system", "the user", "the application", etc.
-    match = re.search(r'\b(the system|the user|the application|the module|the service)\b', sentence, re.IGNORECASE)
+        except (ValueError, AttributeError):
+            pass
+    match = re.search(
+        r'\b(the system|the user|the application|the module|the service|'
+        r'the platform|the database|the api|the interface|the admin)\b',
+        sentence, re.IGNORECASE
+    )
     if match:
         return match.group(0)
-    # Return first 4 words as subject
     words = sentence.split()
     return " ".join(words[:min(4, len(words))])
 
 
 def extract_action(sentence: str) -> str:
+    """
+    Extracts the action phrase from a requirement sentence.
+    - Removes the 70-char hard cut (was truncating long actions)
+    - Strips modal verbs (shall/must/can/will) from the result
+      so actions read as plain verbs: "allow login" not "shall allow login"
+    """
     lower = sentence.lower()
-    # Look for modal + verb pattern
+    # Find the first functional verb in the sentence
     for verb in FUNCTIONAL_VERBS:
         if verb in lower:
             idx = lower.find(verb)
-            fragment = sentence[idx:idx + 70]
-            # Cut at first period or newline
-            fragment = re.split(r'[.\n]', fragment)[0].strip()
+            # Take from the verb to end of sentence (cut at . ; newline only)
+            fragment = sentence[idx:]
+            fragment = re.split(r'[.;\n]', fragment)[0].strip()
+            # Remove modal verbs from the extracted action
+            fragment = _clean_modal(fragment)
             return fragment if len(fragment) > 3 else verb
-    # Regex: find first main verb
+    # Regex: modal + verb fallback
     match = re.search(r'\b(shall|must|should|will|can)\s+(\w+)', sentence, re.IGNORECASE)
     if match:
-        return f"{match.group(1)} {match.group(2)}"
+        return match.group(2)          # return just the main verb, no modal
     nlp = get_nlp()
     if nlp is not None:
         doc = nlp(sentence)
         for token in doc:
             if token.pos_ == "VERB" and token.dep_ in ("ROOT", "relcl", "advcl"):
-                return sentence[token.idx: token.idx + 60].split(".")[0].strip()
+                fragment = sentence[token.idx:].split(".")[0].strip()
+                return _clean_modal(fragment)
     return "perform the specified operation"
 
 
@@ -147,18 +250,37 @@ def assign_environment(testing_type: str) -> str:
 
 # ─── REMARKS GENERATION ───────────────────────────────────────────────────────
 
-def generate_remarks(sentence: str, req_id: str) -> str:
+def generate_remarks(sentence: str, req_id: str, notes_context: str = "") -> str:
+    """
+    Generates the Remarks/Additional Information field.
+    Includes:
+    - Test basis (which SRS/ICD section the scenario is based on)
+    - Notes, enum definitions, and sub-requirement references from the document
+    - Analysis-based observations (boundary, security, integration, error handling)
+    - Calculation basis / input value derivation statement
+    Spec §3: data between requirements (notes, justification, sub-reqs) must be included.
+    """
     lower = sentence.lower()
     remarks = []
 
+    # Always include test basis / calculation basis
+    remarks.append(
+        f"Test basis: SRS requirement {req_id}. "
+        f"Input values derived from SRS/ICD signal definitions."
+    )
+
+    # Include document-level notes context (enums, cross-refs, justification)
+    if notes_context and notes_context.strip():
+        remarks.append(f"Document context: {notes_context.strip()}")
+
     if not any(k in lower for k in BOUNDARY_TRIGGERS):
-        remarks.append("No boundary values specified in SRS — define min/max constraints before testing")
+        remarks.append("No explicit boundary values specified in SRS — define min/max constraints before execution")
 
     if any(k in lower for k in SECURITY_KEYWORDS):
         remarks.append("PII/security risk — ensure data masking and credential rotation in test environment")
 
     if any(w in lower for w in ["payment", "card", "bank", "billing", "invoice", "transaction", "credit"]):
-        remarks.append("PCI-DSS compliance concern — use tokenised/synthetic test data only, no real card data")
+        remarks.append("PCI-DSS compliance — use tokenised/synthetic test data only, no real card data")
 
     if any(k in lower for k in INTEGRATION_KEYWORDS):
         remarks.append("External system dependency detected — mock/stub required for isolated unit testing")
@@ -169,10 +291,7 @@ def generate_remarks(sentence: str, req_id: str) -> str:
     if "error" not in lower and "fail" not in lower and "invalid" not in lower and "reject" not in lower:
         remarks.append("No error handling path specified in SRS — negative scenario coverage is assumed")
 
-    if not remarks:
-        remarks.append(f"Verify this test case against SRS section {req_id} before execution")
-
-    return ". ".join(remarks) + "."
+    return " | ".join(remarks)
 
 
 # ─── DEPENDENCY RESOLUTION ────────────────────────────────────────────────────
@@ -190,17 +309,632 @@ def resolve_dependencies(scenario_type: str, previous: List[TestCase], req_id: s
 
 # ─── CORE GENERATION ─────────────────────────────────────────────────────────
 
+# ─── DECISION TABLE ENGINE ────────────────────────────────────────────────────
+# Detects requirements that contain a decision table (SC_N columns with
+# Input_N / Output_N rows) and generates one precise test case per scenario
+# instead of the generic normal/boundary/edge/robustness pattern.
+
+_SC_PATTERN     = re.compile(r'\bSC[_\-]?\d+\b', re.IGNORECASE)
+_INPUT_PATTERN  = re.compile(r'\bInput[_\-]?\d+\b', re.IGNORECASE)
+_OUTPUT_PATTERN = re.compile(r'\bOutput[_\-]?\d+\b', re.IGNORECASE)
+
+
+def _detect_decision_table(content: str) -> bool:
+    """
+    Returns True if the requirement content contains a decision table.
+    Signal: 2+ SC_N column headers + Input_N rows + Output_N rows.
+    """
+    sc_count = len(_SC_PATTERN.findall(content))
+    return (
+        sc_count >= 2
+        and bool(_INPUT_PATTERN.search(content))
+        and bool(_OUTPUT_PATTERN.search(content))
+    )
+
+
+def _split_table_row(line: str) -> list:
+    """
+    Splits a table row into cells.
+    Handles: tab-separated, pipe-separated (DOCX), multi-space-separated.
+    Strips empty cells and leading/trailing whitespace.
+    """
+    # Pipe-separated (DOCX table export: "Input_1 | Tail Low | TRUE | TRUE")
+    if '|' in line:
+        parts = [p.strip() for p in line.split('|')]
+        return [p for p in parts if p]
+    # Tab-separated
+    if '\t' in line:
+        return [p.strip() for p in line.split('\t') if p.strip()]
+    # Multi-space-separated (2+ spaces as column delimiter)
+    parts = re.split(r' {2,}', line.strip())
+    if len(parts) >= 2:
+        return [p.strip() for p in parts if p.strip()]
+    # Single-space: used as fallback — split on known value tokens
+    # (TRUE/FALSE/Active/Inactive at end of line)
+    return [p.strip() for p in line.split() if p.strip()]
+
+
+def _parse_decision_table(content: str) -> dict:
+    """
+    Parses a decision table from requirement content.
+
+    Robust against multiple formats:
+      Tab-separated    : Input_1\tTail Low\tTRUE\tTRUE\tTRUE\tFALSE
+      Pipe-separated   : Input_1 | Tail Low | TRUE | TRUE | TRUE | FALSE
+      Multi-space      : Input_1  Tail Low  TRUE  TRUE  TRUE  FALSE
+
+    Returns:
+      { "SC_1": { "inputs": {"Name": "value"}, "outputs": {"Name": "value"} }, ... }
+    """
+    sc_headers = _SC_PATTERN.findall(content)
+    if not sc_headers:
+        return {}
+
+    # Deduplicate SC headers preserving order
+    seen, unique_sc = set(), []
+    for sc in sc_headers:
+        key = sc.upper()
+        if key not in seen:
+            seen.add(key)
+            unique_sc.append(sc)
+    sc_headers = unique_sc
+    n_sc = len(sc_headers)
+
+    scenarios = {sc: {"inputs": {}, "outputs": {}} for sc in sc_headers}
+
+    for line in content.splitlines():
+        raw = line.strip()
+        if not raw:
+            continue
+
+        # ── Input row ────────────────────────────────────────────────────────
+        inp_m = re.match(r'Input[_\-]?\d+[\s\|]+(.+)', raw, re.IGNORECASE)
+        if inp_m:
+            rest  = inp_m.group(1).strip()
+            cells = _split_table_row(rest)
+            # cells[0] = input name, cells[1..] = one value per SC column
+            if len(cells) >= 2:
+                name = cells[0]
+                for i, sc in enumerate(sc_headers):
+                    if i + 1 < len(cells):
+                        scenarios[sc]["inputs"][name] = cells[i + 1]
+            continue
+
+        # ── Output row ───────────────────────────────────────────────────────
+        out_m = re.match(r'Output[_\-]?\d+[\s\|]+(.+)', raw, re.IGNORECASE)
+        if out_m:
+            rest  = out_m.group(1).strip()
+            cells = _split_table_row(rest)
+            if len(cells) >= 2:
+                name = cells[0]
+                for i, sc in enumerate(sc_headers):
+                    if i + 1 < len(cells):
+                        scenarios[sc]["outputs"][name] = cells[i + 1]
+
+    # ── Fallback: if standard parsing found no inputs, try column-by-column ──
+    # Handles when Input_N label is on a separate line from values
+    if all(not d["inputs"] for d in scenarios.values()):
+        scenarios = _parse_decision_table_by_columns(content, sc_headers)
+
+    return scenarios
+
+
+def _parse_decision_table_by_columns(content: str, sc_headers: list) -> dict:
+    """
+    Fallback parser: builds the table by scanning ALL lines and mapping
+    values to SC columns positionally.
+    Used when Input_N and values are not on the same line.
+    """
+    scenarios = {sc: {"inputs": {}, "outputs": {}} for sc in sc_headers}
+    lines = [l.strip() for l in content.splitlines() if l.strip()]
+
+    # Find the header line containing SC_N labels
+    header_idx = next(
+        (i for i, l in enumerate(lines) if _SC_PATTERN.search(l)), None
+    )
+    if header_idx is None:
+        return scenarios
+
+    # Map SC label → column index within the header line
+    header_cells = _split_table_row(lines[header_idx])
+    sc_col_map = {}
+    for ci, cell in enumerate(header_cells):
+        m = _SC_PATTERN.match(cell.strip())
+        if m:
+            sc_col_map[cell.strip()] = ci
+
+    for line in lines[header_idx + 1:]:
+        cells = _split_table_row(line)
+        if len(cells) < 2:
+            continue
+        inp_m = re.match(r'Input[_\-]?\d+', cells[0], re.IGNORECASE)
+        out_m = re.match(r'Output[_\-]?\d+', cells[0], re.IGNORECASE)
+        if not inp_m and not out_m:
+            continue
+        if len(cells) < 2:
+            continue
+        name = cells[1] if len(cells) > 1 else cells[0]
+        for sc, col_idx in sc_col_map.items():
+            if col_idx < len(cells):
+                val = cells[col_idx]
+                if inp_m:
+                    scenarios[sc]["inputs"][name] = val
+                else:
+                    scenarios[sc]["outputs"][name] = val
+
+    return scenarios
+
+
+def _all_outputs_true(outputs: dict) -> bool:
+    """Returns True when ALL output values are TRUE/Active/1/Yes."""
+    positive = {"true", "active", "1", "yes", "enabled", "set"}
+    return all(str(v).strip().lower() in positive for v in outputs.values())
+
+
+def _generate_decision_table_tcs(
+    req_id:    str,
+    scenarios: dict,
+    chunk:     "DocumentChunk",
+    tc_counters: Dict[str, int],
+    sc_counter:  int,
+    review_points: dict,
+) -> Tuple[List["TestCase"], int]:
+    """
+    Generates one test case per decision table scenario (SC_1, SC_2 …).
+
+    Scenario type assignment:
+      - All outputs TRUE/Active  → normal    (all conditions met — positive case)
+      - Any output FALSE/Inactive → edge     (one or more conditions violated)
+
+    Priority:
+      - Normal positive case → P1
+      - Negative / edge cases → P1 (decision table TCs are always high priority
+        because they encode the exact acceptance criteria)
+
+    Design methodology → Decision Table Testing (cause-effect analysis).
+    """
+    results: List["TestCase"] = []
+
+    for sc_id, data in scenarios.items():
+        inputs_dict  = data.get("inputs",  {})
+        outputs_dict = data.get("outputs", {})
+
+        if not inputs_dict and not outputs_dict:
+            continue
+
+        # Determine scenario type from outputs
+        positive      = _all_outputs_true(outputs_dict)
+        scenario_type = "normal" if positive else "edge"
+
+        # Build precise inputs list: "Name: Value"
+        inputs_list = [f"{name}: {value}" for name, value in inputs_dict.items()]
+
+        # Build expected outcome from outputs
+        outcome_parts = [f"{name} = {value}" for name, value in outputs_dict.items()]
+        expected      = "; ".join(outcome_parts)
+
+        # Build precise test steps
+        steps = ["1. Initialise system to a known clean state"]
+        for j, (name, value) in enumerate(inputs_dict.items(), start=2):
+            steps.append(f"{j}. Set {name} = {value}")
+        trigger_step = len(steps) + 1
+        steps.append(f"{trigger_step}. Trigger the Altitude direction logic module evaluation")
+        verify_step = trigger_step + 1
+        for k, (out_name, out_val) in enumerate(outputs_dict.items()):
+            steps.append(f"{verify_step + k}. Verify {out_name} is {out_val}")
+        steps.append(
+            f"{verify_step + len(outputs_dict)}. "
+            f"Confirm no unexpected side effects or state changes occur"
+        )
+
+        # Build preconditions
+        preconds = [
+            f"System is initialised in the {chunk.module} module",
+            "All input signals are controllable in the test environment",
+            "Previous test state has been cleared",
+        ]
+        # Add enum notes if present
+        for name, value in inputs_dict.items():
+            lower_val = value.lower()
+            if lower_val in ("active", "inactive", "in active"):
+                preconds.append(
+                    f"{name} accepts enum values: Active / Inactive"
+                )
+                break
+
+        # Remarks explain why this scenario was generated
+        notes_ctx = getattr(chunk, "notes_context", "")
+        notes_suffix = f" | Document context: {notes_ctx}" if notes_ctx else ""
+        test_basis = (
+            f" | Test basis: SRS requirement {req_id}. "
+            f"Input values derived from SRS/ICD signal definitions."
+        )
+
+        active_conditions = [
+            f"{name}={value}"
+            for name, value in inputs_dict.items()
+            if str(value).strip().lower() in ("true", "active", "1", "yes")
+        ]
+        inactive_conditions = [
+            f"{name}={value}"
+            for name, value in inputs_dict.items()
+            if str(value).strip().lower() not in ("true", "active", "1", "yes")
+        ]
+
+        if positive:
+            remarks = (
+                f"DECISION TABLE — {sc_id} is the POSITIVE scenario: "
+                f"all conditions met ({', '.join(active_conditions)}). "
+                f"Verifies that the output is correctly set to TRUE when all "
+                f"required conditions are simultaneously active."
+                f"{test_basis}{notes_suffix}"
+            )
+        else:
+            remarks = (
+                f"DECISION TABLE — {sc_id} is a NEGATIVE scenario: "
+                f"condition(s) not met: {', '.join(inactive_conditions)}. "
+                f"Verifies that the output correctly remains FALSE when at "
+                f"least one required condition is violated."
+                f"{test_basis}{notes_suffix}"
+            )
+
+        tc_counters["UT"] += 1
+        tc_id = f"TC_UT_{tc_counters['UT']:03d}"
+
+        results.append(TestCase(
+            traceability_req_id  = req_id,
+            test_case_id         = tc_id,
+            scenario_id          = f"SC-{sc_counter:03d}",
+            priority             = "P1",
+            objective            = (
+                f"Verify Altitude Alert Condition Enabled output for {sc_id}: "
+                f"{expected}"
+            ),
+            preconditions        = preconds,
+            test_steps           = steps,
+            inputs               = inputs_list,
+            design_methodology   = "Decision Table Testing",
+            dependent_test_cases = "None",
+            expected_outcome     = (
+                f"For scenario {sc_id}: {expected}. "
+                f"The logic module correctly evaluates all input conditions "
+                f"and sets the output as per the decision table."
+            ),
+            test_environment     = "Dev",
+            remarks              = remarks,
+            module               = chunk.module,
+            requirement_type     = chunk.requirement_type,
+            scenario_type        = scenario_type,
+            testing_type         = "verification",
+        ))
+        sc_counter += 1
+
+    logger.info(
+        f"Decision table: {req_id} → {len(results)} TCs "
+        f"({len(scenarios)} scenarios)"
+    )
+    return results, sc_counter
+
+
+# ─── CONDITION COVERAGE ENGINE ────────────────────────────────────────────────
+# Handles requirements of the form:
+#   "shall set OUTPUT to True when ALL following conditions are met,
+#    otherwise set to false"
+# Automatically generates:
+#   SC_1 — positive: all conditions at required values → output = True
+#   SC_2 — negative: condition 1 violated                → output = False
+#   SC_3 — negative: condition 2 violated                → output = False
+#   ...one negative scenario per condition
+
+_COND_COVERAGE_PATTERN = re.compile(
+    r'when\s+all\s+(?:the\s+)?following\s+(?:conditions\s+)?(?:are\s+)?(?:met|true|satisfied|fulfilled)',
+    re.IGNORECASE
+)
+
+
+def _detect_conditional_requirement(content: str) -> bool:
+    """True when requirement uses 'when all following conditions are met' structure."""
+    return bool(_COND_COVERAGE_PATTERN.search(content))
+
+
+def _get_flip_value(name: str, value: str, full_content: str) -> str:
+    """Returns the opposite/invalid value for a condition input."""
+    lv = value.lower()
+    # Boolean flip
+    if lv in ('true', 'yes', '1', 'enabled'):  return 'False'
+    if lv in ('false', 'no', '0', 'disabled'): return 'True'
+    # Enum: look for Notes section listing enum values
+    key = name.split()[-1]
+    em = re.search(
+        rf'(?:{re.escape(name)}|{re.escape(key)})\s+is\s+an\s+enum\s+with\s+\d+\s+values?\s+(\w+)\s+and\s+(\w+)',
+        full_content, re.IGNORECASE
+    )
+    if em:
+        v1, v2 = em.group(1), em.group(2)
+        return v2 if value.lower() == v1.lower() else v1
+    # Common opposites
+    return {
+        'active': 'Inactive', 'inactive': 'Active',
+        'high': 'Low',        'low': 'High',
+        'on': 'Off',          'off': 'On',
+        'enabled': 'Disabled', 'disabled': 'Enabled',
+        'set': 'Reset',       'reset': 'Set',
+    }.get(lv, f'Not {value}')
+
+
+def _parse_conditional_requirement(content: str) -> dict:
+    """
+    Parses a conditional requirement into output + conditions.
+    Returns:
+      {
+        output_name:    "Altitude Alert Condition Enabled",
+        output_true_val: "True",
+        output_false_val: "false",
+        conditions: [
+          { name: "Tail Low Condition",   required_val: "True",     flip_val: "False" },
+          { name: "Radio altitude",        required_val: "True",     flip_val: "False" },
+          { name: "Not all the landing gears extended",
+                                           required_val: "Inactive", flip_val: "Active" },
+        ]
+      }
+    """
+    result = {
+        "output_name":     "",
+        "output_true_val": "True",
+        "output_false_val": "False",
+        "conditions":      [],
+    }
+
+    # Extract output variable and its true/false values
+    set_m = re.search(
+        r"shall\s+set\s+(?:the\s+)?([\w\s]{3,50}?)\s+to\s+[\"\'\u2018\u2019\u201c\u201d]?(True|Enabled|Active|1)[\"\'\u2018\u2019\u201c\u201d]?",
+        content, re.IGNORECASE
+    )
+    if set_m:
+        result["output_name"]     = set_m.group(1).strip().rstrip("'")
+        result["output_true_val"] = set_m.group(2)
+
+    otherwise_m = re.search(
+        r"otherwise\s+set\s+to\s+[\"\'\u2018\u2019\u201c\u201d]?(\w+)[\"\'\u2018\u2019\u201c\u201d]?", content, re.IGNORECASE
+    )
+    if otherwise_m:
+        result["output_false_val"] = otherwise_m.group(1)
+
+    # Split at "conditions are met" to get the conditions block
+    parts = _COND_COVERAGE_PATTERN.split(content)
+    cond_text = parts[1] if len(parts) > 1 else content
+
+    # Parse each line as a condition "X is Y"
+    for line in cond_text.splitlines():
+        line = line.strip().lstrip('*-•→►▶\u2022').strip()
+        if not line:
+            continue
+        if re.match(r'notes?:\s*', line, re.IGNORECASE):
+            continue
+        if len(line.split()) < 3:
+            continue
+
+        m = re.match(
+            r'(.+?)\s+is\s+(True|False|Active|Inactive|Enabled|Disabled|Set|Reset|\w+)\s*\.?\s*$',
+            line, re.IGNORECASE
+        )
+        if m:
+            raw_name = m.group(1).strip()
+            # Strip leading "The " / "the "
+            name = re.sub(r'^[Tt]he\s+', '', raw_name).strip()
+            req_val  = m.group(2)
+            flip_val = _get_flip_value(name, req_val, content)
+            result["conditions"].append({
+                "name":         name,
+                "required_val": req_val,
+                "flip_val":     flip_val,
+            })
+
+    return result
+
+
+def _generate_condition_coverage_tcs(
+    req_id:    str,
+    parsed:    dict,
+    chunk:     "DocumentChunk",
+    tc_counters: Dict[str, int],
+    sc_counter:  int,
+    review_points: dict,
+) -> Tuple[List["TestCase"], int]:
+    """
+    Generates one TC per scenario using Condition Coverage methodology:
+      SC_1   — POSITIVE: all conditions at required values → output = True
+      SC_2+  — NEGATIVE: one condition violated per scenario → output = False
+
+    This matches the manually authored decision table the user would write
+    for requirements of the form 'set X when all conditions are met'.
+    """
+    conditions      = parsed["conditions"]
+    output_name     = parsed["output_name"] or "output"
+    true_val        = parsed["output_true_val"]
+    false_val       = parsed["output_false_val"]
+
+    if not conditions:
+        return [], sc_counter
+
+    results: List["TestCase"] = []
+
+    # ── Build all scenarios ───────────────────────────────────────────────────
+    scenarios = []
+
+    # SC_1: positive — all conditions at required value
+    scenarios.append({
+        "sc_label":  "SC_1",
+        "kind":      "positive",
+        "inputs":    {c["name"]: c["required_val"] for c in conditions},
+        "output":    true_val,
+        "violated":  None,
+    })
+
+    # SC_2..N: negative — one condition violated per scenario
+    for i, cond in enumerate(conditions):
+        sc_inputs = {}
+        for c in conditions:
+            sc_inputs[c["name"]] = cond["flip_val"] if c["name"] == cond["name"] else c["required_val"]
+        scenarios.append({
+            "sc_label":  f"SC_{i + 2}",
+            "kind":      "negative",
+            "inputs":    sc_inputs,
+            "output":    false_val,
+            "violated":  cond["name"],
+        })
+
+    # ── Generate one TestCase per scenario ────────────────────────────────────
+    first_tc_id = None
+    for sc in scenarios:
+        tc_counters["UT"] += 1
+        tc_id = f"TC_UT_{tc_counters['UT']:03d}"
+        if first_tc_id is None:
+            first_tc_id = tc_id
+
+        inputs_list = [f"{name}: {val}" for name, val in sc["inputs"].items()]
+
+        # Build precise numbered steps
+        steps = ["1. Initialise the system to a known clean state"]
+        for j, (name, val) in enumerate(sc["inputs"].items(), start=2):
+            steps.append(f"{j}. Set {name} = {val}")
+        trigger = len(steps) + 1
+        steps.append(f"{trigger}. Trigger the logic module evaluation for {req_id}")
+        steps.append(f"{trigger + 1}. Read the value of {output_name}")
+        steps.append(f"{trigger + 2}. Verify {output_name} equals {sc['output']}")
+        steps.append(f"{trigger + 3}. Confirm no unexpected state changes or side effects")
+
+        notes_ctx = getattr(chunk, "notes_context", "")
+        notes_suffix = f" | Document context: {notes_ctx}" if notes_ctx else ""
+
+        if sc["kind"] == "positive":
+            objective = (
+                f"Verify {output_name} is set to {true_val} "
+                f"when ALL conditions are simultaneously met ({sc['sc_label']})"
+            )
+            remarks = (
+                f"CONDITION COVERAGE — {sc['sc_label']} POSITIVE: "
+                f"all {len(conditions)} conditions are at their required values. "
+                f"Verifies the AND-logic produces {true_val} as expected. "
+                f"Test basis: SRS requirement {req_id}. "
+                f"Input values derived from SRS/ICD signal definitions."
+                f"{notes_suffix}"
+            )
+            scenario_type = "normal"
+            deps = "None"
+        else:
+            objective = (
+                f"Verify {output_name} remains {false_val} "
+                f"when {sc['violated']} is not met ({sc['sc_label']})"
+            )
+            remarks = (
+                f"CONDITION COVERAGE — {sc['sc_label']} NEGATIVE: "
+                f"condition violated: {sc['violated']} = {sc['inputs'][sc['violated']]} "
+                f"(required: {next(c['required_val'] for c in conditions if c['name']==sc['violated'])}). "
+                f"Verifies AND-logic correctly produces {false_val} when this condition fails. "
+                f"Test basis: SRS requirement {req_id}. "
+                f"Input values derived from SRS/ICD signal definitions."
+                f"{notes_suffix}"
+            )
+            scenario_type = "edge"
+            deps = first_tc_id
+
+        results.append(TestCase(
+            traceability_req_id  = req_id,
+            test_case_id         = tc_id,
+            scenario_id          = f"SC-{sc_counter:03d}",
+            priority             = "P1",
+            objective            = objective,
+            preconditions        = [
+                f"System is initialised in the {chunk.module} module",
+                "All input signals are independently controllable in the test environment",
+                "Previous test state has been reset to baseline",
+                f"Output signal {output_name} is observable/measurable",
+            ],
+            test_steps           = steps,
+            inputs               = inputs_list,
+            design_methodology   = "Condition Coverage Testing",
+            dependent_test_cases = deps,
+            expected_outcome     = (
+                f"{output_name} = {sc['output']}. "
+                f"Logic module correctly evaluates all conditions and "
+                f"sets the output as per the requirement specification."
+            ),
+            test_environment     = "Dev",
+            remarks              = remarks,
+            module               = chunk.module,
+            requirement_type     = chunk.requirement_type,
+            scenario_type        = scenario_type,
+            testing_type         = "verification",
+        ))
+        sc_counter += 1
+
+    logger.info(
+        f"Condition coverage: {req_id} → {len(results)} TCs "
+        f"(1 positive + {len(conditions)} negative)"
+    )
+    return results, sc_counter
+
+
 def generate_for_chunk(
     chunk: DocumentChunk,
     tc_counters: Dict[str, int],
     sc_counter: int,
     review_points: dict,
+    req_to_first_tc: Dict[str, str] = None,
 ) -> Tuple[List[TestCase], int]:
     """
     Generates test cases for all sentences in a chunk.
+
+    Parent-child awareness:
+    - Sub-requirement chunks include parent context in content
+    - Sub-requirement TCs reference the parent's first normal TC in dependent_test_cases
+    - Parent chunks with children get one extra integration TC combining all children
+
     Returns (test_cases, updated_sc_counter).
     """
-    sentences = extract_requirement_sentences(chunk.content)
+    if req_to_first_tc is None:
+        req_to_first_tc = {}
+
+    primary_req_id = chunk.requirement_ids[0] if chunk.requirement_ids else "REQ-001"
+    raw_content    = chunk.content
+
+    # ── Condition coverage fast-path ─────────────────────────────────────────
+    # "shall set X to True when ALL following conditions are met, otherwise False"
+    # → generate 1 positive + 1 negative per condition (no pre-existing table needed)
+    if _detect_conditional_requirement(raw_content):
+        parsed_cond = _parse_conditional_requirement(raw_content)
+        if parsed_cond["conditions"]:
+            return _generate_condition_coverage_tcs(
+                primary_req_id, parsed_cond, chunk,
+                tc_counters, sc_counter, review_points
+            )
+
+    # ── Decision table fast-path ──────────────────────────────────────────────
+    # If the requirement contains a pre-built decision table (SC_N / Input_N / Output_N),
+    # generate one precise TC per scenario column.
+    if _detect_decision_table(raw_content):
+        scenarios = _parse_decision_table(raw_content)
+        if scenarios:
+            return _generate_decision_table_tcs(
+                primary_req_id, scenarios, chunk,
+                tc_counters, sc_counter, review_points
+            )
+
+    # ── Standard generation path (no decision table found) ───────────────────
+    # For sub-requirements: strip the [Parent...] prefix for sentence extraction
+    # but keep it available for context in remarks
+    if chunk.is_sub_req and raw_content.startswith("[Parent"):
+        # Extract just the sub-requirement content for sentence processing
+        sub_marker = f"[Sub-Requirement {chunk.requirement_ids[0]}]: "
+        if sub_marker in raw_content:
+            processing_content = raw_content.split(sub_marker, 1)[1]
+        else:
+            processing_content = raw_content
+    else:
+        processing_content = raw_content
+
+    sentences = extract_requirement_sentences(processing_content)
     results: List[TestCase] = []
 
     # If RP2 is off, only generate 'normal' scenario
@@ -212,84 +946,111 @@ def generate_for_chunk(
 
     prefix_map = {"validation": "VD", "integration": "IT", "verification": "UT"}
 
-    for req_id in chunk.requirement_ids:
-        for sentence in sentences:
-            # RP3: testing type assignment
-            if review_points.get("rp3", True):
-                testing_type = assign_testing_type(sentence, chunk.module)
-            else:
-                testing_type = "verification"
+    # Primary requirement ID for this chunk — used as the traceability ID
+    # chunk.requirement_ids[0] is the exact ID from the document (e.g. FR-001)
+    # If multiple IDs exist (cross-references), they are stored in all_ids
+    # but the primary ID is always [0]
+    for sentence in sentences:
+      try:
+        # RP3: testing type assignment
+        if review_points.get("rp3", True):
+            testing_type = assign_testing_type(sentence, chunk.module)
+        else:
+            testing_type = "verification"
 
-            env = assign_environment(testing_type)
-            prefix = prefix_map[testing_type]
-            subject = extract_subject(sentence)
-            action = extract_action(sentence)
+        env    = assign_environment(testing_type)
+        prefix = prefix_map[testing_type]
+        subject = extract_subject(sentence)
+        action  = extract_action(sentence)
 
-            # RP4: remarks
-            remarks = (
-                generate_remarks(sentence, req_id)
-                if review_points.get("rp4", True)
-                else f"Verify against SRS section {req_id} before execution."
-            )
+        # RP4: remarks — include notes_context from document (enums, sub-reqs, notes)
+        notes_ctx = getattr(chunk, "notes_context", "")
+        remarks = (
+            generate_remarks(sentence, primary_req_id, notes_ctx)
+            if review_points.get("rp4", True)
+            else f"Test basis: SRS requirement {primary_req_id}. Verify before execution."
+        )
 
-            for scenario_type in scenario_types:
-                tc_counters[prefix] += 1
-                tc_id = f"TC_{prefix}_{tc_counters[prefix]:03d}"
-                sc_id = f"SC-{sc_counter:03d}"
+        for scenario_type in scenario_types:
+            tc_counters[prefix] += 1
+            tc_id = f"TC_{prefix}_{tc_counters[prefix]:03d}"
+            sc_id = f"SC-{sc_counter:03d}"
 
-                priority = assign_priority(chunk.requirement_type, scenario_type, testing_type)
-                methodology = assign_methodology(sentence, scenario_type)
+            priority    = assign_priority(chunk.requirement_type, scenario_type, testing_type)
+            methodology = assign_methodology(sentence, scenario_type)
 
-                # Build steps
-                steps = [
-                    s.format(
-                        subject=subject,
-                        action=action,
-                        edge_input="concurrent request / session timeout / state transition",
-                        robustness_input="SQL injection / XSS payload / oversized input",
-                    )
-                    for s in STEP_TEMPLATES[scenario_type]
-                ]
+            # Escape curly braces in action/subject so .format() does not
+            # misinterpret document text like {GPS} or {value} as placeholders
+            action_fmt  = action.replace("{", "{{").replace("}", "}}") if action else "perform operation"
+            subject_fmt = subject.replace("{", "{{").replace("}", "}}") if subject else "the system"
 
-                # Build inputs
-                inputs = [
-                    t.format(subject=subject)
-                    for t in INPUT_TEMPLATES[scenario_type]
-                ]
+            # Build steps
+            steps = [
+                s.format(
+                    subject=subject_fmt,
+                    action=action_fmt,
+                    edge_input="concurrent request / session timeout / state transition",
+                    robustness_input="SQL injection / XSS payload / oversized input",
+                )
+                for s in STEP_TEMPLATES[scenario_type]
+            ]
 
-                # Build preconditions
-                preconditions = [
-                    t.format(module=chunk.module, subject=subject, env=env)
-                    for t in PRECONDITION_TEMPLATES[scenario_type]
-                ]
+            # Build inputs
+            inputs = [
+                t.format(subject=subject_fmt)
+                for t in INPUT_TEMPLATES[scenario_type]
+            ]
 
-                # Build expected outcome
-                expected = EXPECTED_OUTCOME_TEMPLATES[scenario_type].format(action=action)
+            # Build preconditions
+            preconditions = [
+                t.format(module=chunk.module, subject=subject_fmt, env=env)
+                for t in PRECONDITION_TEMPLATES[scenario_type]
+            ]
 
-                # Dependency
-                deps = resolve_dependencies(scenario_type, results, req_id)
+            # Build expected outcome
+            expected = EXPECTED_OUTCOME_TEMPLATES[scenario_type].format(action=action_fmt)
 
-                results.append(TestCase(
-                    traceability_req_id=req_id,
-                    test_case_id=tc_id,
-                    scenario_id=sc_id,
-                    priority=priority,
-                    objective=f"Verify that {subject} can {action} under {scenario_type} conditions",
-                    preconditions=preconditions,
-                    test_steps=steps,
-                    inputs=inputs,
-                    design_methodology=methodology,
-                    dependent_test_cases=deps,
-                    expected_outcome=expected,
-                    test_environment=env,
-                    remarks=remarks,
-                    module=chunk.module,
-                    requirement_type=chunk.requirement_type,
-                    scenario_type=scenario_type,
-                    testing_type=testing_type,
-                ))
+            # Dependency resolution:
+            # - For scenario types: boundary/edge/robustness depend on normal TC
+            # - For sub-requirements: normal TC depends on parent's first normal TC
+            deps = resolve_dependencies(scenario_type, results, primary_req_id)
+            if scenario_type == "normal" and chunk.is_sub_req and chunk.parent_id:
+                parent_tc = req_to_first_tc.get(chunk.parent_id)
+                if parent_tc:
+                    deps = parent_tc   # sub-req normal TC depends on parent normal TC
 
-            sc_counter += 1
+            results.append(TestCase(
+                traceability_req_id  = primary_req_id,
+                test_case_id         = tc_id,
+                scenario_id          = sc_id,
+                priority             = priority,
+                objective            = f"Verify {subject} {action} under {scenario_type} conditions",
+                preconditions        = preconditions,
+                test_steps           = steps,
+                inputs               = inputs,
+                design_methodology   = methodology,
+                dependent_test_cases = deps,
+                expected_outcome     = expected,
+                test_environment     = env,
+                remarks              = remarks,
+                module               = chunk.module,
+                requirement_type     = chunk.requirement_type,
+                scenario_type        = scenario_type,
+                testing_type         = testing_type,
+            ))
+
+        # Track first TC generated for this requirement (used for sub-req dependencies)
+        if primary_req_id not in req_to_first_tc and results:
+            # Find the first normal TC for this req
+            for tc in results:
+                if tc.traceability_req_id == primary_req_id and tc.scenario_type == "normal":
+                    req_to_first_tc[primary_req_id] = tc.test_case_id
+                    break
+
+      except Exception as _sentence_err:
+          logger.warning(f"Skipping sentence due to error: {_sentence_err} — sentence: {sentence[:60]}")
+
+      sc_counter += 1
 
     return results, sc_counter
 
@@ -297,8 +1058,25 @@ def generate_for_chunk(
 # ─── DEDUPLICATION ────────────────────────────────────────────────────────────
 
 def deduplicate(test_cases: List[TestCase]) -> Tuple[List[TestCase], int]:
+    """
+    Removes duplicate test cases (by objective similarity).
+    EXCEPTION: Decision Table and Condition Coverage TCs are NEVER deduplicated —
+    each scenario is intentionally distinct by design (different input values).
+    After removal, re-sequences:
+    - scenario_id: SC-001, SC-002, SC-003 ... sequential order
+    - test_case_id: TC_UT_001, TC_VD_001 etc. restarted per prefix
+    Spec §4.4: after duplicates removed, Scenario No and TC_ID must be sequential.
+    """
+    PROTECTED_METHODOLOGIES = {"Decision Table Testing", "Condition Coverage Testing"}
+
     kept, seen, removed = [], [], 0
     for tc in test_cases:
+        # Protect decision table and condition coverage TCs from deduplication
+        if tc.design_methodology in PROTECTED_METHODOLOGIES:
+            kept.append(tc)
+            seen.append(tc.objective)
+            continue
+
         is_dup = any(
             SequenceMatcher(None, tc.objective.lower(), s.lower()).ratio() > DEDUP_THRESHOLD
             for s in seen
@@ -309,8 +1087,300 @@ def deduplicate(test_cases: List[TestCase]) -> Tuple[List[TestCase], int]:
         else:
             seen.append(tc.objective)
             kept.append(tc)
+
     logger.info(f"Deduplication: kept {len(kept)}, removed {removed}")
-    return kept, removed
+
+    # Re-sequence scenario IDs and TC IDs after deduplication
+    prefix_counters: Dict[str, int] = {}
+    sc_num = 1
+    old_to_new: Dict[str, str] = {}
+
+    resequenced: List[TestCase] = []
+    for tc in kept:
+        m = re.match(r'^(TC_[A-Z]+_)', tc.test_case_id)
+        prefix = m.group(1) if m else "TC_UT_"
+        prefix_counters[prefix] = prefix_counters.get(prefix, 0) + 1
+        new_tc_id = f"{prefix}{prefix_counters[prefix]:03d}"
+        new_sc_id = f"SC-{sc_num:03d}"
+        old_to_new[tc.test_case_id] = new_tc_id
+        resequenced.append(tc.model_copy(update={
+            "test_case_id": new_tc_id,
+            "scenario_id": new_sc_id,
+        }))
+        sc_num += 1
+
+    # Fix dependency references
+    final: List[TestCase] = []
+    for tc in resequenced:
+        deps = tc.dependent_test_cases
+        for old_id, new_id in old_to_new.items():
+            deps = deps.replace(old_id, new_id)
+        if deps != tc.dependent_test_cases:
+            final.append(tc.model_copy(update={"dependent_test_cases": deps}))
+        else:
+            final.append(tc)
+
+    return final, removed
+
+
+# ─── MAIN ENTRY POINT ─────────────────────────────────────────────────────────
+
+# ─── PARENT + CHILD ANALYSIS ENGINE ──────────────────────────────────────────
+
+def _clean_sub_content(chunk: DocumentChunk) -> str:
+    """Returns the sub-requirement content without the [Parent...] prefix."""
+    c = chunk.content
+    if "[Sub-Requirement" in c:
+        parts = c.split("]: ", 1)
+        return parts[1].strip() if len(parts) > 1 else c
+    return c
+
+
+def _should_merge(parent_chunk: DocumentChunk, child_chunks: List[DocumentChunk]) -> bool:
+    """
+    Decides whether parent + children should be MERGED into single test cases.
+
+    MERGE when ALL conditions met:
+    ✓ 2 or 3 children (≤3 — more becomes unwieldy in one TC)
+    ✓ All children in the same module as parent
+    ✓ Each child is a simple, short refinement (≤ 30 words)
+    ✓ Children share the same subject as parent (they are parts of ONE behaviour)
+
+    SEPARATE when ANY condition fails:
+    ✗ 4 or more children
+    ✗ A child belongs to a different module
+    ✗ Any child is long / introduces distinct new behaviour (> 30 words)
+    """
+    if len(child_chunks) < 2 or len(child_chunks) > 3:
+        return False
+    if any(c.module != parent_chunk.module for c in child_chunks):
+        return False
+    parent_subject = extract_subject(parent_chunk.content).lower()
+    for child in child_chunks:
+        clean = _clean_sub_content(child)
+        if len(clean.split()) > 30:
+            return False
+        # Children that introduce completely new subjects → separate
+        child_subject = extract_subject(clean).lower()
+        if child_subject and parent_subject and child_subject not in parent_subject and parent_subject not in child_subject:
+            # Allow if subjects are very short tokens (likely same entity, different wording)
+            if len(child_subject.split()) > 2 and len(parent_subject.split()) > 2:
+                return False
+    return True
+
+
+def _generate_merged_tcs(
+    parent_chunk: DocumentChunk,
+    child_chunks: List[DocumentChunk],
+    tc_counters: Dict[str, int],
+    sc_counter: int,
+    review_points: dict,
+) -> Tuple[List[TestCase], int]:
+    """
+    Generates MERGED test cases: parent + all children covered in one TC per scenario.
+    Used when children are simple refinements of the parent.
+
+    The traceability_req_id shows ALL IDs: "HLR-NAV-001 [+.1,.2]"
+    Steps explicitly verify each sub-requirement within the same TC.
+    """
+    results      = []
+    prefix_map   = {"validation": "VD", "integration": "IT", "verification": "UT"}
+    parent_id    = parent_chunk.requirement_ids[0]
+    child_ids    = [c.requirement_ids[0] for c in child_chunks]
+    combined_id  = f"{parent_id} [incl. {', '.join(child_ids)}]"
+
+    parent_content = parent_chunk.content
+    subject = extract_subject(parent_content)
+    action  = extract_action(parent_content)
+
+    testing_type = assign_testing_type(parent_content, parent_chunk.module)
+    prefix       = prefix_map[testing_type]
+    env          = assign_environment(testing_type)
+
+    scenario_types = (
+        ("normal", "boundary", "edge", "robustness")
+        if review_points.get("rp2", True)
+        else ("normal",)
+    )
+
+    for scenario_type in scenario_types:
+        tc_counters[prefix] += 1
+        tc_id = f"TC_{prefix}_{tc_counters[prefix]:03d}"
+        sc_id = f"SC-{sc_counter:03d}"
+
+        # Escape curly braces so .format() does not misread document tokens
+        action_fmt  = action.replace("{", "{{").replace("}", "}}") if action else "perform operation"
+        subject_fmt = subject.replace("{", "{{").replace("}", "}}") if subject else "the system"
+
+        # Base steps for this scenario
+        base_steps = [
+            s.format(
+                subject=subject_fmt, action=action_fmt,
+                edge_input="concurrent/timeout/state-transition",
+                robustness_input="SQL injection / XSS / malformed input",
+            )
+            for s in STEP_TEMPLATES[scenario_type]
+        ]
+
+        # Append explicit sub-requirement verification steps
+        sub_steps = []
+        for i, (child_id, child) in enumerate(zip(child_ids, child_chunks), start=1):
+            child_action = extract_action(_clean_sub_content(child))
+            sub_steps.append(
+                f"{len(base_steps)+i}. Verify sub-req {child_id}: {child_action}"
+            )
+        sub_steps.append(
+            f"{len(base_steps)+len(sub_steps)+1}. Confirm all sub-requirements "
+            f"collectively satisfy parent {parent_id}"
+        )
+
+        # Combined inputs cover parent + all children
+        inputs = [t.format(subject=subject_fmt) for t in INPUT_TEMPLATES[scenario_type]]
+        inputs.append(f"Sub-requirements scope: {', '.join(child_ids)}")
+
+        remarks_text = (
+            f"MERGED TC — covers {combined_id} as a single unit. "
+            f"Children are simple refinements of the parent; merging reduces "
+            f"redundancy and keeps traceability tight. "
+        )
+        if review_points.get("rp4", True):
+            remarks_text += generate_remarks(parent_content, parent_id)
+
+        results.append(TestCase(
+            traceability_req_id  = combined_id,
+            test_case_id         = tc_id,
+            scenario_id          = sc_id,
+            priority             = assign_priority(parent_chunk.requirement_type, scenario_type, testing_type),
+            objective            = (
+                f"Verify {subject} {action} "
+                f"satisfying {parent_id} and sub-requirements "
+                f"{', '.join(child_ids)} under {scenario_type} conditions"
+            ),
+            preconditions        = [
+                t.format(module=parent_chunk.module, subject=subject_fmt, env=env)
+                for t in PRECONDITION_TEMPLATES[scenario_type]
+            ],
+            test_steps           = base_steps + sub_steps,
+            inputs               = inputs,
+            design_methodology   = assign_methodology(parent_content, scenario_type),
+            dependent_test_cases = "None",
+            expected_outcome     = (
+                EXPECTED_OUTCOME_TEMPLATES[scenario_type].format(action=action_fmt)
+                + f" All sub-requirements ({', '.join(child_ids)}) "
+                f"are satisfied within this single test."
+            ),
+            test_environment     = env,
+            remarks              = remarks_text,
+            module               = parent_chunk.module,
+            requirement_type     = parent_chunk.requirement_type,
+            scenario_type        = scenario_type,
+            testing_type         = testing_type,
+        ))
+
+    sc_counter += 1
+    logger.info(
+        f"MERGED: {parent_id} + {child_ids} → "
+        f"{len(results)} TCs (children are simple refinements)"
+    )
+    return results, sc_counter
+
+
+def _generate_separated_tcs(
+    parent_chunk: DocumentChunk,
+    child_chunks: List[DocumentChunk],
+    tc_counters: Dict[str, int],
+    sc_counter: int,
+    review_points: dict,
+    req_to_first_tc: Dict[str, str],
+) -> Tuple[List[TestCase], int]:
+    """
+    Generates SEPARATE test cases for parent and each child individually,
+    plus one integration TC that verifies them working together.
+    Used when children introduce distinct behaviours.
+    """
+    all_results  = []
+    parent_id    = parent_chunk.requirement_ids[0]
+    prefix_map   = {"validation": "VD", "integration": "IT", "verification": "UT"}
+
+    # ── Generate parent TCs (without child context) ───────────────────────────
+    parent_tcs, sc_counter = generate_for_chunk(
+        parent_chunk, tc_counters, sc_counter, review_points, req_to_first_tc
+    )
+    all_results.extend(parent_tcs)
+    logger.info(f"SEPARATE parent {parent_id}: {len(parent_tcs)} TCs")
+
+    # ── Generate individual TCs for each child ────────────────────────────────
+    for child in child_chunks:
+        child_id   = child.requirement_ids[0]
+        child_tcs, sc_counter = generate_for_chunk(
+            child, tc_counters, sc_counter, review_points, req_to_first_tc
+        )
+        all_results.extend(child_tcs)
+        logger.info(f"SEPARATE child  {child_id}: {len(child_tcs)} TCs")
+
+    # ── Integration TC: parent + all children together ────────────────────────
+    tc_counters["IT"] += 1
+    int_tc_id = f"TC_IT_{tc_counters['IT']:03d}"
+    child_ids = [c.requirement_ids[0] for c in child_chunks]
+
+    # Dependencies: first normal TC of every child
+    child_first_tcs = [req_to_first_tc[cid] for cid in child_ids if cid in req_to_first_tc]
+    parent_first_tc = req_to_first_tc.get(parent_id, "None")
+
+    int_steps = [
+        f"1. Confirm all individual TCs for {parent_id} have passed",
+    ]
+    for i, child_id in enumerate(child_ids, start=2):
+        int_steps.append(f"{i}. Confirm all individual TCs for sub-req {child_id} have passed")
+    int_steps += [
+        f"{len(child_ids)+2}. Execute a combined end-to-end flow covering the full scope of {parent_id}",
+        f"{len(child_ids)+3}. Verify there are no gaps, conflicts, or overlaps between sub-requirements",
+        f"{len(child_ids)+4}. Confirm sub-requirements collectively and completely satisfy {parent_id}",
+    ]
+
+    deps = ", ".join([parent_first_tc] + child_first_tcs) if parent_first_tc != "None" or child_first_tcs else "None"
+
+    all_results.append(TestCase(
+        traceability_req_id  = parent_id,
+        test_case_id         = int_tc_id,
+        scenario_id          = f"SC-{sc_counter:03d}",
+        priority             = "P1",
+        objective            = (
+            f"Verify that {parent_id} and its sub-requirements "
+            f"({', '.join(child_ids)}) work correctly together as a complete unit"
+        ),
+        preconditions        = [
+            f"All individual TCs for {parent_id} have passed",
+            f"All individual TCs for sub-requirements ({', '.join(child_ids)}) have passed",
+            f"System is in a clean state in the {parent_chunk.module} module",
+        ],
+        test_steps           = int_steps,
+        inputs               = [
+            "Combined inputs exercising the full scope of the parent requirement",
+            "Valid data satisfying all sub-requirement constraints simultaneously",
+        ],
+        design_methodology   = "Integration Testing",
+        dependent_test_cases = deps,
+        expected_outcome     = (
+            f"Sub-requirements {', '.join(child_ids)} collectively satisfy "
+            f"{parent_id} with no gaps or conflicts. "
+            f"The system behaves correctly as a complete integrated unit."
+        ),
+        test_environment     = "QA",
+        remarks              = (
+            f"INTEGRATION TC — generated because {parent_id} has "
+            f"{len(child_chunks)} children with distinct behaviours. "
+            f"Run AFTER all individual TCs have passed. "
+            f"Validates completeness and inter-operability of sub-requirements."
+        ),
+        module               = parent_chunk.module,
+        requirement_type     = parent_chunk.requirement_type,
+        scenario_type        = "normal",
+        testing_type         = "integration",
+    ))
+    sc_counter += 1
+    logger.info(f"SEPARATE integration TC {int_tc_id} for {parent_id} + {child_ids}")
+    return all_results, sc_counter
 
 
 # ─── MAIN ENTRY POINT ─────────────────────────────────────────────────────────
@@ -320,21 +1390,74 @@ def generate_all(
     review_points: dict,
 ) -> Tuple[List[TestCase], int]:
     """
-    Generate test cases for all document chunks.
-    Returns (test_cases, duplicates_removed).
+    Generates test cases for all chunks with intelligent parent-child handling.
+
+    For EVERY parent requirement, children are analysed IN-LINE (not after):
+      → _should_merge() decides: simple refinements → MERGE, distinct behaviours → SEPARATE
+      → MERGE  : one set of TCs per scenario type covering parent + all children together
+      → SEPARATE: individual TCs for parent + each child + one integration TC
+
+    Standalone requirements (no parent, no children): standard generation.
+    Sub-requirements whose parent was already processed: SKIPPED (handled inline).
     """
-    tc_counters = {"VD": 0, "IT": 0, "UT": 0}
-    sc_counter = 1
-    all_test_cases: List[TestCase] = []
+    tc_counters     = {"VD": 0, "IT": 0, "UT": 0}
+    sc_counter      = 1
+    all_test_cases  : List[TestCase] = []
+    req_to_first_tc : Dict[str, str] = {}
+    processed       : set            = set()   # tracks req_ids already handled
+
+    id_to_chunk = {
+        c.requirement_ids[0]: c
+        for c in chunks if c.requirement_ids
+    }
 
     for chunk in chunks:
-        tcs, sc_counter = generate_for_chunk(
-            chunk, tc_counters, sc_counter, review_points
-        )
-        all_test_cases.extend(tcs)
-        logger.info(
-            f"Chunk {chunk.chunk_index} [{chunk.module}]: generated {len(tcs)} test cases"
-        )
+        if not chunk.requirement_ids:
+            continue
+        req_id = chunk.requirement_ids[0]
+        if req_id in processed:
+            continue  # already handled inline with its parent
+
+        # ── Case 1: Parent with children ──────────────────────────────────────
+        if chunk.has_children:
+            child_chunks = [
+                id_to_chunk[cid]
+                for cid in chunk.child_ids
+                if cid in id_to_chunk
+            ]
+
+            if _should_merge(chunk, child_chunks):
+                # ── MERGE: children are simple refinements ──────────────────
+                tcs, sc_counter = _generate_merged_tcs(
+                    chunk, child_chunks, tc_counters, sc_counter, review_points
+                )
+            else:
+                # ── SEPARATE: children have distinct behaviours ─────────────
+                tcs, sc_counter = _generate_separated_tcs(
+                    chunk, child_chunks, tc_counters, sc_counter,
+                    review_points, req_to_first_tc
+                )
+
+            all_test_cases.extend(tcs)
+            processed.add(req_id)
+            for child in child_chunks:
+                processed.add(child.requirement_ids[0])
+
+        # ── Case 2: Orphan sub-requirement (parent not in document) ──────────
+        elif chunk.is_sub_req and chunk.parent_id not in id_to_chunk:
+            tcs, sc_counter = generate_for_chunk(
+                chunk, tc_counters, sc_counter, review_points, req_to_first_tc
+            )
+            all_test_cases.extend(tcs)
+            processed.add(req_id)
+
+        # ── Case 3: Standalone requirement (no parent, no children) ──────────
+        elif not chunk.is_sub_req:
+            tcs, sc_counter = generate_for_chunk(
+                chunk, tc_counters, sc_counter, review_points, req_to_first_tc
+            )
+            all_test_cases.extend(tcs)
+            processed.add(req_id)
 
     if review_points.get("rp5", True):
         all_test_cases, removed = deduplicate(all_test_cases)
@@ -342,3 +1465,5 @@ def generate_all(
         removed = 0
 
     return all_test_cases, removed
+
+

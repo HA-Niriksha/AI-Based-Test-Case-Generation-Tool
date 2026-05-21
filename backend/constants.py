@@ -3,6 +3,11 @@
 # ─────────────────────────────────────────────
 
 MODULE_KEYWORDS = [
+    # Avionics / aerospace domain
+    "Altitude Direction", "Altitude Alert", "Radio Altitude", "Landing Gear",
+    "Flight Control", "Navigation", "Warning System", "MCU", "Avionics",
+    "Autopilot", "Flight Management", "Ground Proximity", "TCAS",
+    # Generic software modules
     "Login", "Authentication", "Registration", "User Management",
     "Dashboard", "Search", "Filter", "Payment", "Checkout", "Cart",
     "Order", "Notification", "Email", "Report", "Export", "API",
@@ -17,6 +22,9 @@ FUNCTIONAL_VERBS = [
     "authorise", "authorize", "notify", "generate", "export", "import",
     "upload", "download", "verify", "confirm", "reject", "approve",
     "assign", "track", "monitor", "log", "record", "send", "receive",
+    # Avionics-specific
+    "set", "activate", "deactivate", "inhibit", "arm", "trigger",
+    "alert", "warn", "detect", "compute", "output", "indicate",
 ]
 
 NON_FUNCTIONAL_KEYWORDS = [
@@ -32,6 +40,8 @@ BOUNDARY_TRIGGERS = [
     "at least", "at most", "no more than", "up to", "exceed",
     "greater than", "less than", "exactly", "characters", "digits",
     "max", "min", "threshold", "capacity", "quota",
+    # Avionics
+    "altitude", "feet", "meters", "threshold", "rate",
 ]
 
 SECURITY_KEYWORDS = [
@@ -70,14 +80,15 @@ VALIDATION_ACTION_WORDS = [
 STEP_TEMPLATES = {
     "normal": [
         "1. Ensure all preconditions are satisfied",
-        "2. Prepare valid test data for {subject}",
-        "3. Execute the action: {action}",
+        "2. Prepare valid test data for {subject} (values as per SRS/ICD specification)",
+        "3. Execute: {action}",
         "4. Observe system response",
         "5. Compare actual result with expected outcome",
+        "6. Verify all output signals are within specification",
     ],
     "boundary": [
         "1. Ensure all preconditions are satisfied",
-        "2. Identify boundary values: minimum, maximum, min-1, max+1",
+        "2. Identify boundary values for {subject}: minimum, maximum, min-1, max+1 (as per SRS/ICD)",
         "3. Set input to boundary value: [min / max / min-1 / max+1 / null / empty]",
         "4. Execute the action: {action}",
         "5. Record system response for each boundary value",
@@ -85,7 +96,7 @@ STEP_TEMPLATES = {
     ],
     "edge": [
         "1. Configure system to an unusual but valid state",
-        "2. Prepare edge-case input: {edge_input}",
+        "2. Prepare edge-case input for {subject}: {edge_input}",
         "3. Execute {action} under the edge condition",
         "4. Observe system behaviour (concurrent access / state transition / timeout)",
         "5. Verify system remains stable and produces correct output",
@@ -93,10 +104,10 @@ STEP_TEMPLATES = {
     ],
     "robustness": [
         "1. Ensure all preconditions are satisfied",
-        "2. Prepare malformed/attack input: {robustness_input}",
-        "3. Submit the malformed input via: {action}",
-        "4. Verify system returns appropriate error (HTTP 400 / validation error)",
-        "5. Confirm no data corruption, crash, or security bypass occurred",
+        "2. Prepare malformed/invalid input for {subject}: {robustness_input}",
+        "3. Submit invalid input via: {action}",
+        "4. Verify system returns appropriate error or safe-state response",
+        "5. Confirm no data corruption, crash, or unsafe output occurred",
         "6. Review system logs for error handling evidence",
     ],
 }
@@ -104,37 +115,36 @@ STEP_TEMPLATES = {
 # ─────────────────────────────────────────────
 #  INPUT TEMPLATES
 # ─────────────────────────────────────────────
+# Note: for condition-coverage and decision-table requirements, the actual
+# signal names replace the placeholder {subject}. These templates are used
+# only for standard (non-decision-table) requirements.
 
 INPUT_TEMPLATES = {
     "normal": [
-        "{subject}: valid data conforming to SRS specification",
-        "Test environment: properly initialised",
-        "User credentials: valid and authorised",
+        "{subject}: valid value conforming to SRS specification",
+        "Test environment: properly initialised and in known state",
+        "All prerequisite signals: at required values per SRS/ICD",
     ],
     "boundary": [
-        "{subject}: minimum allowed value (as per SRS)",
-        "{subject}: maximum allowed value (as per SRS)",
+        "{subject}: minimum allowed value (as per SRS/ICD)",
+        "{subject}: maximum allowed value (as per SRS/ICD)",
         "{subject}: minimum - 1 (below valid range)",
         "{subject}: maximum + 1 (above valid range)",
         "{subject}: null / None / undefined",
-        "{subject}: empty string ''",
-        "{subject}: zero (0) where numeric",
+        "{subject}: empty / zero where applicable",
     ],
     "edge": [
-        "{subject}: concurrent request with duplicate data",
-        "{subject}: valid data during active session expiry/timeout",
-        "{subject}: valid data with maximum simultaneous users active",
-        "{subject}: rapid successive requests (within 100ms)",
-        "{subject}: valid data after partial system failure/recovery",
+        "{subject}: valid value during simultaneous condition change",
+        "{subject}: valid value at exact state transition boundary",
+        "{subject}: rapid successive input changes (within scan cycle)",
+        "{subject}: valid value during partial system initialisation",
     ],
     "robustness": [
-        "{subject}: SQL injection — ' OR 1=1 --",
-        "{subject}: XSS payload — <script>alert(document.cookie)</script>",
-        "{subject}: extremely large value (10,000+ characters / 999999999)",
-        "{subject}: special characters — !@#$%^&*()<>?/|{{}}[]",
-        "{subject}: null bytes — \\x00\\x00\\x00",
-        "{subject}: Unicode overflow — \\uFFFD\\uFFFE",
-        "{subject}: path traversal — ../../etc/passwd",
+        "{subject}: out-of-range value (beyond specification limits)",
+        "{subject}: invalid enum value (not in defined set)",
+        "{subject}: unexpected NULL / undefined signal",
+        "{subject}: corrupted / garbled input data",
+        "{subject}: simultaneous conflicting input values",
     ],
 }
 
@@ -146,26 +156,26 @@ PRECONDITION_TEMPLATES = {
     "normal": [
         "System is initialised and running in {env} environment",
         "Test data for {module} module is prepared and available",
-        "User has appropriate permissions for {module} operations",
-        "Required dependent services/modules are active",
+        "All input signals are set to initial/default values",
+        "Required dependent modules/services are active",
     ],
     "boundary": [
         "System is initialised and running in {env} environment",
-        "Boundary values for {subject} are defined and documented in SRS",
+        "Boundary values for {subject} are defined and documented in SRS/ICD",
         "Test data includes minimum, maximum, and out-of-range values",
-        "Validation rules for {subject} are implemented and active",
+        "Validation logic for {subject} is implemented and active",
     ],
     "edge": [
         "System is initialised and running in {env} environment",
         "System is in a valid but non-standard state for {module}",
-        "Concurrent access simulation tooling is available if required",
-        "Session and timeout configurations are set to test values",
+        "Concurrent signal simulation capability is available if required",
+        "State transition monitoring is active",
     ],
     "robustness": [
         "System is initialised and running in {env} environment",
-        "System logging is enabled and being actively monitored",
-        "Intrusion detection/WAF is in monitoring mode (not blocking) for test",
+        "System logging and fault detection is enabled and actively monitored",
         "Test is performed in isolated environment with no production data",
+        "Safety monitors are in passive/observation mode for test",
     ],
 }
 
@@ -175,23 +185,23 @@ PRECONDITION_TEMPLATES = {
 
 EXPECTED_OUTCOME_TEMPLATES = {
     "normal": (
-        "System successfully {action} with valid inputs. "
-        "Response is returned within acceptable time. "
-        "Data is persisted/processed correctly as per SRS specification."
+        "System successfully executes {action} with valid inputs. "
+        "All output signals are set correctly as per SRS specification. "
+        "No unexpected state changes or side effects occur."
     ),
     "boundary": (
         "System correctly handles all boundary values: "
-        "accepts inputs within valid range, rejects out-of-range inputs "
-        "with a clear, user-friendly error message. No data corruption occurs."
+        "accepts inputs within valid range, rejects or handles out-of-range inputs "
+        "with appropriate response. No data corruption occurs."
     ),
     "edge": (
         "System remains stable and produces correct output under edge-case conditions. "
         "No data loss, state corruption, or unhandled exceptions occur. "
-        "System recovers gracefully from the edge condition."
+        "System recovers or transitions gracefully from the edge condition."
     ),
     "robustness": (
-        "System rejects malformed/malicious input with HTTP 400 or appropriate error response. "
-        "No data corruption, no application crash, and no security bypass occurs. "
-        "Error is logged. No sensitive information is exposed in the error response."
+        "System responds to invalid/out-of-range input with a safe, defined behaviour. "
+        "No data corruption, application crash, or unsafe output state occurs. "
+        "Fault is detected and logged. No sensitive information is exposed."
     ),
 }

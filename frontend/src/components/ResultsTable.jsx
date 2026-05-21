@@ -1,23 +1,21 @@
 import { useState, useMemo } from 'react'
 
+// Columns match the Excel output_generator.py structure exactly
 const COLUMNS = [
-  { key: 'traceability_req_id',  label: 'Req-ID',        width: 90  },
-  { key: 'test_case_id',         label: 'TC-ID',         width: 110 },
-  { key: 'scenario_id',          label: 'Scenario',      width: 80  },
-  { key: 'priority',             label: 'Priority',      width: 70  },
-  { key: 'objective',            label: 'Objective',     width: 280 },
-  { key: 'preconditions',        label: 'Preconditions', width: 220 },
-  { key: 'test_steps',           label: 'Steps',         width: 250 },
-  { key: 'inputs',               label: 'Inputs',        width: 220 },
-  { key: 'design_methodology',   label: 'Methodology',   width: 150 },
-  { key: 'dependent_test_cases', label: 'Depends On',    width: 110 },
-  { key: 'expected_outcome',     label: 'Expected',      width: 240 },
-  { key: 'test_environment',     label: 'Env',           width: 70  },
-  { key: 'remarks',              label: 'Remarks',       width: 240 },
-  { key: 'module',               label: 'Module',        width: 110 },
-  { key: 'requirement_type',     label: 'Req Type',      width: 110 },
-  { key: 'scenario_type',        label: 'Scenario Type', width: 110 },
-  { key: 'testing_type',         label: 'Testing Type',  width: 110 },
+  { key: 'traceability_req_id',  label: 'Requirement_ID',                 width: 130 },
+  { key: 'test_case_id',         label: 'TC_ID',                          width: 120 },
+  { key: 'scenario_id',          label: 'Scenario No',                    width: 100 },
+  { key: 'module',               label: 'Module',                         width: 130 },
+  { key: 'objective',            label: 'Test Objective',                  width: 300 },
+  { key: 'preconditions',        label: 'Test Precondition',               width: 240 },
+  { key: 'test_steps',           label: 'Test Steps',                      width: 280 },
+  { key: 'inputs',               label: 'Inputs (Signal Values)',          width: 250 },
+  { key: 'expected_outcome',     label: 'Expected Outputs',                width: 220 },
+  { key: 'dependent_test_cases', label: 'Depands On',                     width: 120 },
+  { key: 'remarks',              label: 'Remarks / Additional Information',width: 260 },
+  { key: 'design_methodology',   label: 'Methodology',                    width: 170 },
+  { key: 'requirement_type',     label: 'Req_Type',                       width: 120 },
+  { key: 'scenario_type',        label: 'Scenario_Type',                  width: 120 },
 ]
 
 function badge(type, value) {
@@ -35,12 +33,13 @@ function badge(type, value) {
 
 function CellValue({ col, value }) {
   if (Array.isArray(value)) {
+    // Steps already have 1. 2. 3. numbering — no bullet prefix needed
     return (
-      <ul className="space-y-0.5 list-none m-0 p-0">
+      <ol className="space-y-1 list-none m-0 p-0">
         {value.map((v, i) => (
-          <li key={i} className="text-[11px] text-dim leading-snug">• {v}</li>
+          <li key={i} className="text-[11px] text-dim leading-snug">{v}</li>
         ))}
-      </ul>
+      </ol>
     )
   }
   const badgeCols = ['priority', 'scenario_type', 'testing_type', 'requirement_type', 'test_environment']

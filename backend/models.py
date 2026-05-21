@@ -10,6 +10,7 @@ class TestCase(BaseModel):
     objective: str
     preconditions: List[str]
     test_steps: List[str]
+    # Inputs now stored as named key=value pairs; plain list kept for compatibility
     inputs: List[str]
     design_methodology: str
     dependent_test_cases: str
@@ -34,11 +35,17 @@ class TestSuite(BaseModel):
 
 
 class DocumentChunk(BaseModel):
-    chunk_index: int
-    module: str
+    chunk_index:      int
+    module:           str
     requirement_type: Literal["functional", "non-functional"]
-    requirement_ids: List[str]
-    content: str
+    requirement_ids:  List[str]
+    content:          str
+    parent_id:        Optional[str]  = None
+    child_ids:        List[str]      = []
+    is_sub_req:       bool           = False
+    has_children:     bool           = False
+    # NEW: notes, enum definitions, sub-requirement references, inter-req context
+    notes_context:    str            = ""
 
 
 class UploadResponse(BaseModel):

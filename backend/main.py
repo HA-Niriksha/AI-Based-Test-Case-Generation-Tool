@@ -62,6 +62,27 @@ def _error(error: str, layer: str, detail: str, suggestion: str, status: int = 5
 
 # ─── ENDPOINTS ────────────────────────────────────────────────────────────────
 
+@app.get("/api/debug/chunks")
+def debug_chunks(session_id: str = Query(...)):
+    session = sessions.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    text   = session.get("text", "")
+    chunks = ingest_document(text)
+    return {
+        "total_chunks": len(chunks),
+        "chunks": [
+            {
+                "chunk_index":      c.chunk_index,
+                "requirement_ids":  c.requirement_ids,
+                "module":           c.module,
+                "requirement_type": c.requirement_type,
+                "content_preview":  c.content[:150],
+            }
+            for c in chunks
+        ],
+    }
+
 @app.get("/api/health", response_model=HealthResponse)
 def health():
     return HealthResponse(
@@ -151,7 +172,12 @@ def generate(request: GenerateRequest):
             "rp5": rp.rp5,
         }
 
-        test_cases, removed = generate_all(chunks, review_points)
+        try:
+            test_cases, removed = generate_all(chunks, review_points)
+        except Exception as gen_err:
+            import traceback
+            logger.error(f"Generation error: {traceback.format_exc()}")
+            raise
 
         if not test_cases:
             _error(
@@ -182,8 +208,6 @@ def generate(request: GenerateRequest):
     except HTTPException:
         raise
     except Exception as e:
-        import traceback
-        print("GENERATE ERROR:", traceback.format_exc())
         _error(
             "Generation failed",
             "generation",

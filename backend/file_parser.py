@@ -18,18 +18,43 @@ def parse_pdf(file_bytes: bytes) -> str:
     return "\n".join(parts)
 
 
+def _paragraph_is_bold_heading(para) -> bool:
+    """
+    Returns True if an entire paragraph is bold-formatted (module heading).
+    Checks both paragraph-level bold runs and character-level formatting.
+    """
+    runs = [r for r in para.runs if r.text.strip()]
+    if not runs:
+        return False
+    # All non-empty runs must be bold
+    return all(r.bold for r in runs)
+
+
 def parse_docx(file_bytes: bytes) -> str:
+    """
+    Parses a DOCX file, preserving:
+    - Bold headings as [MODULE: <text>] markers for module detection
+    - Normal style headings as ## markers
+    - Tables with pipe-separated rows
+    Requirement: per spec §5.3, bold-formatted headings define module boundaries.
+    """
     parts = []
     try:
         doc = Document(io.BytesIO(file_bytes))
         for para in doc.paragraphs:
             text = para.text.strip()
-            if text:
-                # Preserve heading structure
-                if para.style.name.startswith("Heading"):
-                    parts.append(f"\n## {text}")
-                else:
-                    parts.append(text)
+            if not text:
+                continue
+            style_name = para.style.name if para.style else ""
+            if style_name.startswith("Heading"):
+                parts.append(f"\n## {text}")
+                parts.append(f"[MODULE: {text}]")
+            elif _paragraph_is_bold_heading(para):
+                # Bold non-heading paragraph = module section boundary
+                parts.append(f"\n## {text}")
+                parts.append(f"[MODULE: {text}]")
+            else:
+                parts.append(text)
         for table in doc.tables:
             for row in table.rows:
                 row_text = " | ".join(
