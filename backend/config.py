@@ -3,11 +3,14 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# No API key. No LLM endpoint. Fully offline.
-ENGINE = "rule-based-nlp"
+# No API key. No LLM endpoint. Fully offline — rule-based NLP engine.
+ENGINE  = "rule-based-nlp"
 VERSION = "1.0.0"
 
-SPACY_MODEL = os.getenv("SPACY_MODEL", "en_core_web_sm")
+SPACY_MODEL      = os.getenv("SPACY_MODEL",      "en_core_web_sm")
 CHUNK_SIZE_WORDS = int(os.getenv("CHUNK_SIZE_WORDS", "1500"))
-MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
-DEDUP_THRESHOLD = float(os.getenv("DEDUP_THRESHOLD", "0.85"))
+MAX_RETRIES      = int(os.getenv("MAX_RETRIES",   "3"))
+DEDUP_THRESHOLD  = float(os.getenv("DEDUP_THRESHOLD", "0.85"))
+
+# Claude Desktop MCP integration (optional — set MCP_ENABLED=true to activate)
+MCP_ENABLED = os.getenv("MCP_ENABLED", "false").lower() == "true"

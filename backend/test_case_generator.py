@@ -250,61 +250,67 @@ def assign_environment(testing_type: str) -> str:
 
 # ─── REMARKS GENERATION ───────────────────────────────────────────────────────
 
-def generate_remarks(sentence: str, req_id: str, notes_context: str = "") -> str:
+def generate_remarks(sentence: str, req_id: str, notes_context: str = "",
+                     scenario_type: str = "normal", input_source: str = "SRS") -> str:
     """
-    Generates the Remarks/Additional Information field.
-    Includes:
-    - Test basis (which SRS/ICD section the scenario is based on)
-    - Notes, enum definitions, and sub-requirement references from the document
-    - Analysis-based observations (boundary, security, integration, error handling)
-    - Calculation basis / input value derivation statement
-    Spec §3: data between requirements (notes, justification, sub-reqs) must be included.
+    Stores structured remark data as pipe-separated items.
+    The output_generator._remarks_bullets() will format this as bullets (Req 8).
+    Stored items are raw facts — no test-basis lines, no bullet prefixes here.
     """
     lower = sentence.lower()
-    remarks = []
+    items = []
 
-    # Always include test basis / calculation basis
-    remarks.append(
-        f"Test basis: SRS requirement {req_id}. "
-        f"Input values derived from SRS/ICD signal definitions."
-    )
-
-    # Include document-level notes context (enums, cross-refs, justification)
+    # Document-level notes (enum defs, cross-refs) — strip test-basis
     if notes_context and notes_context.strip():
-        remarks.append(f"Document context: {notes_context.strip()}")
+        parts = re.split(r'\s*\|\s*', notes_context.strip())
+        for p in parts:
+            p = p.strip()
+            if p and not re.search(
+                r'test\s+basis|input\s+values\s+derived|srs\s+requirement\s+\w',
+                p, re.IGNORECASE
+            ):
+                items.append(p)
 
+    # Input source (Req 4)
+    if input_source == "ICD":
+        items.append("derived from icd: Input values not explicitly defined in SRS — derived from ICD signal definitions")
+
+    # Analysis observations
     if not any(k in lower for k in BOUNDARY_TRIGGERS):
-        remarks.append("No explicit boundary values specified in SRS — define min/max constraints before execution")
+        items.append("Note: No explicit boundary values in SRS — define min/max constraints before execution")
 
     if any(k in lower for k in SECURITY_KEYWORDS):
-        remarks.append("PII/security risk — ensure data masking and credential rotation in test environment")
+        items.append("Security: PII/security risk — ensure data masking in test environment")
 
     if any(w in lower for w in ["payment", "card", "bank", "billing", "invoice", "transaction", "credit"]):
-        remarks.append("PCI-DSS compliance — use tokenised/synthetic test data only, no real card data")
+        items.append("Compliance: PCI-DSS — use tokenised/synthetic test data only")
 
     if any(k in lower for k in INTEGRATION_KEYWORDS):
-        remarks.append("External system dependency detected — mock/stub required for isolated unit testing")
+        items.append("Integration: External system dependency — mock/stub required")
 
     if any(w in lower for w in ["concurrent", "parallel", "simultaneous", "race", "multi-user"]):
-        remarks.append("Race condition risk — concurrency and load testing strongly recommended")
+        items.append("Risk: Race condition possible — concurrency testing recommended")
 
     if "error" not in lower and "fail" not in lower and "invalid" not in lower and "reject" not in lower:
-        remarks.append("No error handling path specified in SRS — negative scenario coverage is assumed")
+        items.append("Coverage: No error handling path in SRS — negative scenario coverage assumed")
 
-    return " | ".join(remarks)
+    return " | ".join(items)
 
 
 # ─── DEPENDENCY RESOLUTION ────────────────────────────────────────────────────
 
 def resolve_dependencies(scenario_type: str, previous: List[TestCase], req_id: str) -> str:
+    """Requirement 10: Depends On = TC_ID + Scenario No concatenated."""
     if scenario_type == "normal":
         return "None"
-    # Boundary, edge, robustness depend on the last normal test for the same req
     normals = [
-        tc.test_case_id for tc in previous
+        (tc.test_case_id, tc.scenario_id) for tc in previous
         if tc.scenario_type == "normal" and tc.traceability_req_id == req_id
     ]
-    return normals[-1] if normals else "None"
+    if normals:
+        tc_id, sc_id = normals[-1]
+        return f"{tc_id}_{sc_id}"
+    return "None"
 
 
 # ─── CORE GENERATION ─────────────────────────────────────────────────────────
@@ -584,7 +590,7 @@ def _generate_decision_table_tcs(
         results.append(TestCase(
             traceability_req_id  = req_id,
             test_case_id         = tc_id,
-            scenario_id          = f"SC-{sc_counter:03d}",
+            scenario_id          = f"SC_{sc_counter:03d}",
             priority             = "P1",
             objective            = (
                 f"Verify Altitude Alert Condition Enabled output for {sc_id}: "
@@ -616,34 +622,58 @@ def _generate_decision_table_tcs(
     return results, sc_counter
 
 
-# ─── CONDITION COVERAGE ENGINE ────────────────────────────────────────────────
-# Handles requirements of the form:
-#   "shall set OUTPUT to True when ALL following conditions are met,
-#    otherwise set to false"
-# Automatically generates:
-#   SC_1 — positive: all conditions at required values → output = True
-#   SC_2 — negative: condition 1 violated                → output = False
-#   SC_3 — negative: condition 2 violated                → output = False
-#   ...one negative scenario per condition
+# ─── MC/DC ENGINE ─────────────────────────────────────────────────────────────
+# Modified Condition / Decision Coverage (MC/DC) — DO-178C / avionics standard
+#
+# MC/DC requires for EACH condition C in a decision:
+#   There exist two test cases that differ ONLY in the value of C,
+#   and the DECISION (output) changes between those two test cases.
+#   This proves each condition INDEPENDENTLY affects the outcome.
+#
+# For pure AND-logic with n conditions, MC/DC needs exactly n+1 test cases:
+#   TC_baseline : all conditions at required values  → output = True
+#   TC_flip_i   : condition_i flipped, rest unchanged → output = False
+#
+# For OR-logic with n conditions, MC/DC needs exactly n+1 test cases:
+#   TC_baseline : all conditions at their FALSE values → output = False
+#   TC_flip_i   : condition_i set to True, rest unchanged → output = True
+#
+# The independence pair for condition_i is always (TC_baseline, TC_flip_i).
+#
+# Numeric conditions: use ICD range data when available; otherwise use
+# explicit boundary values (valid vs invalid) derived from the requirement.
 
 _COND_COVERAGE_PATTERN = re.compile(
     r'when\s+all\s+(?:the\s+)?following\s+(?:conditions\s+)?(?:are\s+)?(?:met|true|satisfied|fulfilled)',
     re.IGNORECASE
 )
+_OR_PATTERN = re.compile(
+    r'when\s+any\s+(?:one\s+)?(?:of\s+)?(?:the\s+)?following\s+(?:conditions\s+)?(?:are\s+)?(?:met|true|satisfied|fulfilled)',
+    re.IGNORECASE
+)
 
 
 def _detect_conditional_requirement(content: str) -> bool:
-    """True when requirement uses 'when all following conditions are met' structure."""
-    return bool(_COND_COVERAGE_PATTERN.search(content))
+    """True when requirement uses 'when all/any following conditions are met' structure."""
+    return bool(_COND_COVERAGE_PATTERN.search(content)) or bool(_OR_PATTERN.search(content))
 
 
 def _get_flip_value(name: str, value: str, full_content: str) -> str:
-    """Returns the opposite/invalid value for a condition input."""
-    lv = value.lower()
+    """
+    Returns the MC/DC flip value for a condition — the value that makes
+    this condition FALSE (for AND-logic) or TRUE (for OR-logic).
+
+    For boolean/enum: uses known opposites or Notes-declared enum values.
+    For numeric: uses ICD range data (e.g. 'Range: -100 to 100') to produce
+                 a valid out-of-range value that violates the condition.
+    """
+    lv = value.lower().strip()
+
     # Boolean flip
     if lv in ('true', 'yes', '1', 'enabled'):  return 'False'
     if lv in ('false', 'no', '0', 'disabled'): return 'True'
-    # Enum: look for Notes section listing enum values
+
+    # Enum: look for Notes section declaring enum values
     key = name.split()[-1]
     em = re.search(
         rf'(?:{re.escape(name)}|{re.escape(key)})\s+is\s+an\s+enum\s+with\s+\d+\s+values?\s+(\w+)\s+and\s+(\w+)',
@@ -652,42 +682,69 @@ def _get_flip_value(name: str, value: str, full_content: str) -> str:
     if em:
         v1, v2 = em.group(1), em.group(2)
         return v2 if value.lower() == v1.lower() else v1
-    # Common opposites
+
+    # Numeric: check if value is a number, then look for ICD range to find
+    # a value outside the required range → violates the condition
+    try:
+        num_val = float(value)
+        # Look for "Name | Integer/Float | -X to Y" range in ICD table
+        range_m = re.search(
+            rf'{re.escape(name)}\s*\|\s*\w+\s*\|\s*([-\d.]+)\s+to\s+([-\d.]+)',
+            full_content, re.IGNORECASE
+        )
+        if range_m:
+            lo, hi = float(range_m.group(1)), float(range_m.group(2))
+            # Flip value = just outside the valid range
+            flip = lo - 1 if num_val > lo else hi + 1
+            return str(int(flip) if flip == int(flip) else flip)
+        else:
+            # No range info: use 0 if value != 0, else use -1
+            flip_num = 0 if num_val != 0 else -1
+            return str(flip_num)
+    except ValueError:
+        pass
+
+    # Common string opposites
     return {
-        'active': 'Inactive', 'inactive': 'Active',
-        'high': 'Low',        'low': 'High',
-        'on': 'Off',          'off': 'On',
-        'enabled': 'Disabled', 'disabled': 'Enabled',
-        'set': 'Reset',       'reset': 'Set',
-    }.get(lv, f'Not {value}')
+        'active':   'Inactive', 'inactive': 'Active',
+        'high':     'Low',      'low':      'High',
+        'on':       'Off',      'off':      'On',
+        'enabled':  'Disabled', 'disabled': 'Enabled',
+        'set':      'Reset',    'reset':    'Set',
+        'open':     'Closed',   'closed':   'Open',
+        'valid':    'Invalid',  'invalid':  'Valid',
+    }.get(lv, f'Not_{value}')
 
 
 def _parse_conditional_requirement(content: str) -> dict:
     """
-    Parses a conditional requirement into output + conditions.
-    Returns:
-      {
-        output_name:    "Altitude Alert Condition Enabled",
-        output_true_val: "True",
-        output_false_val: "false",
-        conditions: [
-          { name: "Tail Low Condition",   required_val: "True",     flip_val: "False" },
-          { name: "Radio altitude",        required_val: "True",     flip_val: "False" },
-          { name: "Not all the landing gears extended",
-                                           required_val: "Inactive", flip_val: "Active" },
-        ]
-      }
+    Parses a conditional requirement into:
+      - logic_type:     'AND' or 'OR'
+      - output_name:    the output signal name
+      - output_true_val / output_false_val
+      - conditions:     list of { name, required_val, flip_val }
+
+    Supports:
+      - Boolean conditions  (is True / is False)
+      - Enum conditions     (is Active / is Inactive)
+      - Numeric conditions  (is 5 / is 10) with ICD range lookup for flip value
     """
     result = {
-        "output_name":     "",
-        "output_true_val": "True",
+        "logic_type":       "AND",   # default
+        "output_name":      "",
+        "output_true_val":  "True",
         "output_false_val": "False",
-        "conditions":      [],
+        "conditions":       [],
     }
 
-    # Extract output variable and its true/false values
+    # Detect AND vs OR logic
+    if _OR_PATTERN.search(content):
+        result["logic_type"] = "OR"
+
+    # Extract output variable and its true value
     set_m = re.search(
-        r"shall\s+set\s+(?:the\s+)?([\w\s]{3,50}?)\s+to\s+[\"\'\u2018\u2019\u201c\u201d]?(True|Enabled|Active|1)[\"\'\u2018\u2019\u201c\u201d]?",
+        r"shall\s+set\s+(?:the\s+)?([\w\s]{3,60}?)\s+to\s+[\"'\u2018\u2019\u201c\u201d]?"
+        r"(True|Enabled|Active|1)[\"'\u2018\u2019\u201c\u201d]?",
         content, re.IGNORECASE
     )
     if set_m:
@@ -695,33 +752,34 @@ def _parse_conditional_requirement(content: str) -> dict:
         result["output_true_val"] = set_m.group(2)
 
     otherwise_m = re.search(
-        r"otherwise\s+set\s+to\s+[\"\'\u2018\u2019\u201c\u201d]?(\w+)[\"\'\u2018\u2019\u201c\u201d]?", content, re.IGNORECASE
+        r"otherwise\s+set\s+to\s+[\"'\u2018\u2019\u201c\u201d]?(\w+)[\"'\u2018\u2019\u201c\u201d]?",
+        content, re.IGNORECASE
     )
     if otherwise_m:
         result["output_false_val"] = otherwise_m.group(1)
 
-    # Split at "conditions are met" to get the conditions block
-    parts = _COND_COVERAGE_PATTERN.split(content)
+    # Split at the "conditions are met" boundary to isolate the conditions block
+    split_pat = _OR_PATTERN if result["logic_type"] == "OR" else _COND_COVERAGE_PATTERN
+    parts = split_pat.split(content)
     cond_text = parts[1] if len(parts) > 1 else content
 
-    # Parse each line as a condition "X is Y"
+    # Parse each bullet/line as a condition "X is Y"
     for line in cond_text.splitlines():
         line = line.strip().lstrip('*-•→►▶\u2022').strip()
-        if not line:
-            continue
-        if re.match(r'notes?:\s*', line, re.IGNORECASE):
+        if not line or re.match(r'notes?\s*:', line, re.IGNORECASE):
             continue
         if len(line.split()) < 3:
             continue
 
+        # Match: "<name> is <value>" — value can be word or number
         m = re.match(
-            r'(.+?)\s+is\s+(True|False|Active|Inactive|Enabled|Disabled|Set|Reset|\w+)\s*\.?\s*$',
+            r'(.+?)\s+is\s+(True|False|Active|Inactive|Enabled|Disabled|'
+            r'Set|Reset|High|Low|On|Off|Open|Closed|-?\d+(?:\.\d+)?|\w+)\s*\.?\s*$',
             line, re.IGNORECASE
         )
         if m:
             raw_name = m.group(1).strip()
-            # Strip leading "The " / "the "
-            name = re.sub(r'^[Tt]he\s+', '', raw_name).strip()
+            name     = re.sub(r'^[Tt]he\s+', '', raw_name).strip()
             req_val  = m.group(2)
             flip_val = _get_flip_value(name, req_val, content)
             result["conditions"].append({
@@ -733,146 +791,241 @@ def _parse_conditional_requirement(content: str) -> dict:
     return result
 
 
-def _generate_condition_coverage_tcs(
-    req_id:    str,
-    parsed:    dict,
-    chunk:     "DocumentChunk",
-    tc_counters: Dict[str, int],
-    sc_counter:  int,
+def _generate_mcdc_tcs(
+    req_id:        str,
+    parsed:        dict,
+    chunk:         "DocumentChunk",
+    tc_counters:   Dict[str, int],
+    sc_counter:    int,
     review_points: dict,
 ) -> Tuple[List["TestCase"], int]:
     """
-    Generates one TC per scenario using Condition Coverage methodology:
-      SC_1   — POSITIVE: all conditions at required values → output = True
-      SC_2+  — NEGATIVE: one condition violated per scenario → output = False
+    Generates MC/DC (Modified Condition / Decision Coverage) test cases.
 
-    This matches the manually authored decision table the user would write
-    for requirements of the form 'set X when all conditions are met'.
+    MC/DC Rule: For EACH condition C in the decision, there must exist
+    an independence pair — two test cases where:
+      1. Only C changes value between the two cases
+      2. All other conditions remain the same
+      3. The output (decision) changes as a result
+
+    This proves each condition INDEPENDENTLY influences the output.
+
+    For AND-logic (n conditions) → n+1 test cases:
+      TC_baseline : ALL conditions at required values → output = True
+      TC_flip_i   : condition_i flipped, rest unchanged → output = False
+      Independence pair for condition_i = (TC_baseline, TC_flip_i)
+
+    For OR-logic (n conditions) → n+1 test cases:
+      TC_baseline : ALL conditions at their flip (FALSE) values → output = False
+      TC_flip_i   : condition_i set to required (TRUE), rest unchanged → output = True
+      Independence pair for condition_i = (TC_baseline, TC_flip_i)
+
+    Each TC includes in its remarks:
+      - Which condition is being independently exercised
+      - The independence pair reference (TC_baseline ↔ TC_flip_i)
+      - Input source (SRS / ICD)
     """
-    conditions      = parsed["conditions"]
-    output_name     = parsed["output_name"] or "output"
-    true_val        = parsed["output_true_val"]
-    false_val       = parsed["output_false_val"]
+    conditions  = parsed["conditions"]
+    output_name = parsed["output_name"] or "output"
+    true_val    = parsed["output_true_val"]
+    false_val   = parsed["output_false_val"]
+    logic       = parsed.get("logic_type", "AND")
 
     if not conditions:
         return [], sc_counter
 
     results: List["TestCase"] = []
+    notes_ctx = getattr(chunk, "notes_context", "")
 
-    # ── Build all scenarios ───────────────────────────────────────────────────
-    scenarios = []
+    # ── Build MC/DC scenario table ────────────────────────────────────────────
+    # Each row: { sc_label, kind, inputs{name:val}, output, independent_condition }
 
-    # SC_1: positive — all conditions at required value
-    scenarios.append({
-        "sc_label":  "SC_1",
-        "kind":      "positive",
-        "inputs":    {c["name"]: c["required_val"] for c in conditions},
-        "output":    true_val,
-        "violated":  None,
-    })
+    if logic == "AND":
+        # Baseline: all conditions at required values → output = True
+        baseline_inputs = {c["name"]: c["required_val"] for c in conditions}
+        baseline_output = true_val
+        # Flip scenarios: one condition at flip_val, rest at required → output = False
+        flip_scenarios = []
+        for cond in conditions:
+            flip_inputs = {c["name"]: (cond["flip_val"] if c["name"] == cond["name"]
+                                       else c["required_val"]) for c in conditions}
+            flip_scenarios.append({
+                "inputs":     flip_inputs,
+                "output":     false_val,
+                "indep_cond": cond["name"],
+                "from_val":   cond["required_val"],
+                "to_val":     cond["flip_val"],
+            })
+    else:  # OR-logic
+        # Baseline: all conditions at flip (false) values → output = False
+        baseline_inputs = {c["name"]: c["flip_val"] for c in conditions}
+        baseline_output = false_val
+        # Flip scenarios: one condition at required (true), rest at flip → output = True
+        flip_scenarios = []
+        for cond in conditions:
+            flip_inputs = {c["name"]: (cond["required_val"] if c["name"] == cond["name"]
+                                       else c["flip_val"]) for c in conditions}
+            flip_scenarios.append({
+                "inputs":     flip_inputs,
+                "output":     true_val,
+                "indep_cond": cond["name"],
+                "from_val":   cond["flip_val"],
+                "to_val":     cond["required_val"],
+            })
 
-    # SC_2..N: negative — one condition violated per scenario
-    for i, cond in enumerate(conditions):
-        sc_inputs = {}
-        for c in conditions:
-            sc_inputs[c["name"]] = cond["flip_val"] if c["name"] == cond["name"] else c["required_val"]
-        scenarios.append({
-            "sc_label":  f"SC_{i + 2}",
-            "kind":      "negative",
-            "inputs":    sc_inputs,
-            "output":    false_val,
-            "violated":  cond["name"],
-        })
+    # ── Generate TC_baseline first ────────────────────────────────────────────
+    tc_counters["UT"] += 1
+    baseline_tc_id = f"TC_UT_{tc_counters['UT']:03d}"
+    baseline_sc_id = f"SC_{sc_counter:03d}"
 
-    # ── Generate one TestCase per scenario ────────────────────────────────────
-    first_tc_id = None
-    for sc in scenarios:
+    # Independence pairs summary for baseline remarks
+    pairs_summary = "; ".join(
+        f"{s['indep_cond']} independence → ({baseline_tc_id} ↔ TC_UT_{tc_counters['UT'] + i + 1:03d})"
+        for i, s in enumerate(flip_scenarios)
+    )
+
+    # Build steps for baseline
+    baseline_steps = ["1. Initialise the system to a known clean state and reset all signals"]
+    for j, (name, val) in enumerate(baseline_inputs.items(), start=2):
+        baseline_steps.append(f"{j}. Set {name} = {val}")
+    t = len(baseline_steps) + 1
+    baseline_steps += [
+        f"{t}.   Trigger evaluation of the {logic}-decision for {req_id}",
+        f"{t+1}. Read the value of {output_name}",
+        f"{t+2}. Verify {output_name} = {baseline_output} (all conditions {'met' if logic == 'AND' else 'false'})",
+        f"{t+3}. Confirm no unexpected side effects or state changes",
+    ]
+
+    # Input source detection
+    input_source_note = (
+        "• Input source: Values explicitly defined in SRS specification."
+        if all(c["required_val"].lower() not in ("not_", "0", "-1")
+               for c in conditions)
+        else "• Input source: Values not fully defined in SRS — derived from ICD signal definitions."
+    )
+
+    baseline_remarks = (
+        f"• MC/DC BASELINE ({logic}-logic) — {req_id}\n"
+        f"• All {len(conditions)} conditions set to their required values → {output_name} = {baseline_output}\n"
+        f"• This TC is the reference for ALL independence pairs:\n"
+        + "\n".join(
+            f"  - {s['indep_cond']}: baseline (this TC) ↔ "
+            f"TC_UT_{tc_counters['UT'] + i + 1:03d} "
+            f"[{s['indep_cond']} changes {s['from_val']}→{s['to_val']}, output changes]"
+            for i, s in enumerate(flip_scenarios)
+        ) + "\n"
+        f"• MC/DC satisfies DO-178C Level A/B requirement independence criterion\n"
+        + (f"• Document context: {notes_ctx}" if notes_ctx else "")
+        + f"\n{input_source_note}"
+    )
+
+    results.append(TestCase(
+        traceability_req_id  = req_id,
+        test_case_id         = baseline_tc_id,
+        scenario_id          = baseline_sc_id,
+        priority             = "P1",
+        objective            = (
+            f"[MC/DC BASELINE] Verify {output_name} = {baseline_output} "
+            f"when ALL {len(conditions)} conditions are at required values "
+            f"({logic}-logic, {req_id})"
+        ),
+        preconditions        = [
+            f"System is initialised in the {chunk.module} module",
+            "All input signals are independently controllable in the test environment",
+            "Test environment supports individual condition isolation (MC/DC prerequisite)",
+            f"Output signal '{output_name}' is observable and measurable",
+            "Previous test state has been fully reset to baseline",
+        ],
+        test_steps           = baseline_steps,
+        inputs               = [f"{name}: {val}" for name, val in baseline_inputs.items()],
+        design_methodology   = "MC/DC Testing",
+        dependent_test_cases = "None",
+        expected_outcome     = (
+            f"{output_name} = {baseline_output}. "
+            f"{logic}-decision evaluates to {baseline_output} when all conditions are at required values."
+        ),
+        test_environment     = "Dev",
+        remarks              = baseline_remarks,
+        module               = chunk.module,
+        requirement_type     = chunk.requirement_type,
+        scenario_type        = "normal",
+        testing_type         = "verification",
+    ))
+    sc_counter += 1
+
+    # ── Generate one independence TC per condition ─────────────────────────────
+    for i, sc in enumerate(flip_scenarios):
         tc_counters["UT"] += 1
         tc_id = f"TC_UT_{tc_counters['UT']:03d}"
-        if first_tc_id is None:
-            first_tc_id = tc_id
+        sc_id = f"SC_{sc_counter:03d}"
 
-        inputs_list = [f"{name}: {val}" for name, val in sc["inputs"].items()]
-
-        # Build precise numbered steps
-        steps = ["1. Initialise the system to a known clean state"]
+        steps = ["1. Initialise the system to a known clean state and reset all signals"]
         for j, (name, val) in enumerate(sc["inputs"].items(), start=2):
-            steps.append(f"{j}. Set {name} = {val}")
-        trigger = len(steps) + 1
-        steps.append(f"{trigger}. Trigger the logic module evaluation for {req_id}")
-        steps.append(f"{trigger + 1}. Read the value of {output_name}")
-        steps.append(f"{trigger + 2}. Verify {output_name} equals {sc['output']}")
-        steps.append(f"{trigger + 3}. Confirm no unexpected state changes or side effects")
+            marker = "  ← CHANGED (independence flip)" if name == sc["indep_cond"] else ""
+            steps.append(f"{j}. Set {name} = {val}{marker}")
+        t = len(steps) + 1
+        steps += [
+            f"{t}.   Trigger evaluation of the {logic}-decision for {req_id}",
+            f"{t+1}. Read the value of {output_name}",
+            f"{t+2}. Verify {output_name} = {sc['output']} "
+            f"(because {sc['indep_cond']} = {sc['to_val']} violates condition)",
+            f"{t+3}. Confirm independence: ONLY {sc['indep_cond']} differs from {baseline_tc_id}",
+            f"{t+4}. Confirm no unexpected side effects or state changes",
+        ]
 
-        notes_ctx = getattr(chunk, "notes_context", "")
-        notes_suffix = f" | Document context: {notes_ctx}" if notes_ctx else ""
-
-        if sc["kind"] == "positive":
-            objective = (
-                f"Verify {output_name} is set to {true_val} "
-                f"when ALL conditions are simultaneously met ({sc['sc_label']})"
-            )
-            remarks = (
-                f"CONDITION COVERAGE — {sc['sc_label']} POSITIVE: "
-                f"all {len(conditions)} conditions are at their required values. "
-                f"Verifies the AND-logic produces {true_val} as expected. "
-                f"Test basis: SRS requirement {req_id}. "
-                f"Input values derived from SRS/ICD signal definitions."
-                f"{notes_suffix}"
-            )
-            scenario_type = "normal"
-            deps = "None"
-        else:
-            objective = (
-                f"Verify {output_name} remains {false_val} "
-                f"when {sc['violated']} is not met ({sc['sc_label']})"
-            )
-            remarks = (
-                f"CONDITION COVERAGE — {sc['sc_label']} NEGATIVE: "
-                f"condition violated: {sc['violated']} = {sc['inputs'][sc['violated']]} "
-                f"(required: {next(c['required_val'] for c in conditions if c['name']==sc['violated'])}). "
-                f"Verifies AND-logic correctly produces {false_val} when this condition fails. "
-                f"Test basis: SRS requirement {req_id}. "
-                f"Input values derived from SRS/ICD signal definitions."
-                f"{notes_suffix}"
-            )
-            scenario_type = "edge"
-            deps = first_tc_id
+        flip_remarks = (
+            f"• MC/DC INDEPENDENCE TEST — condition: '{sc['indep_cond']}' ({req_id})\n"
+            f"• Independence pair: {baseline_tc_id} (baseline) ↔ {tc_id} (this TC)\n"
+            f"• What changed: {sc['indep_cond']} = {sc['from_val']} → {sc['to_val']}\n"
+            f"• All other conditions unchanged from baseline\n"
+            f"• Output change: {baseline_output} → {sc['output']} "
+            f"(proves {sc['indep_cond']} independently controls the {logic}-decision)\n"
+            f"• MC/DC criterion satisfied for '{sc['indep_cond']}': "
+            f"unique independence pair ({baseline_tc_id}, {tc_id})\n"
+            + (f"• Document context: {notes_ctx}\n" if notes_ctx else "")
+            + f"{input_source_note}"
+        )
 
         results.append(TestCase(
             traceability_req_id  = req_id,
             test_case_id         = tc_id,
-            scenario_id          = f"SC-{sc_counter:03d}",
+            scenario_id          = sc_id,
             priority             = "P1",
-            objective            = objective,
+            objective            = (
+                f"[MC/DC] Verify '{sc['indep_cond']}' independently controls {output_name} "
+                f"({sc['indep_cond']}={sc['to_val']} → {output_name}={sc['output']})"
+            ),
             preconditions        = [
                 f"System is initialised in the {chunk.module} module",
-                "All input signals are independently controllable in the test environment",
-                "Previous test state has been reset to baseline",
-                f"Output signal {output_name} is observable/measurable",
+                "All input signals are independently controllable",
+                f"Baseline TC {baseline_tc_id} has already been executed and passed",
+                f"Only '{sc['indep_cond']}' will differ from the baseline configuration",
+                f"Output signal '{output_name}' is observable and measurable",
             ],
             test_steps           = steps,
-            inputs               = inputs_list,
-            design_methodology   = "Condition Coverage Testing",
-            dependent_test_cases = deps,
+            inputs               = [f"{name}: {val}" for name, val in sc["inputs"].items()],
+            design_methodology   = "MC/DC Testing",
+            dependent_test_cases = baseline_tc_id,
             expected_outcome     = (
                 f"{output_name} = {sc['output']}. "
-                f"Logic module correctly evaluates all conditions and "
-                f"sets the output as per the requirement specification."
+                f"Changing only '{sc['indep_cond']}' from {sc['from_val']} to {sc['to_val']} "
+                f"causes the {logic}-decision to change from {baseline_output} to {sc['output']}. "
+                f"MC/DC independence criterion confirmed for '{sc['indep_cond']}'."
             ),
             test_environment     = "Dev",
-            remarks              = remarks,
+            remarks              = flip_remarks,
             module               = chunk.module,
             requirement_type     = chunk.requirement_type,
-            scenario_type        = scenario_type,
+            scenario_type        = "edge",
             testing_type         = "verification",
         ))
         sc_counter += 1
 
     logger.info(
-        f"Condition coverage: {req_id} → {len(results)} TCs "
-        f"(1 positive + {len(conditions)} negative)"
+        f"MC/DC: {req_id} ({logic}-logic) → {len(results)} TCs "
+        f"(1 baseline + {len(conditions)} independence tests)"
     )
+    return results, sc_counter
     return results, sc_counter
 
 
@@ -899,13 +1052,13 @@ def generate_for_chunk(
     primary_req_id = chunk.requirement_ids[0] if chunk.requirement_ids else "REQ-001"
     raw_content    = chunk.content
 
-    # ── Condition coverage fast-path ─────────────────────────────────────────
-    # "shall set X to True when ALL following conditions are met, otherwise False"
-    # → generate 1 positive + 1 negative per condition (no pre-existing table needed)
+    # ── MC/DC fast-path ──────────────────────────────────────────────────────
+    # "shall set X to True when ALL/ANY following conditions are met"
+    # → generate MC/DC baseline + one independence TC per condition
     if _detect_conditional_requirement(raw_content):
         parsed_cond = _parse_conditional_requirement(raw_content)
         if parsed_cond["conditions"]:
-            return _generate_condition_coverage_tcs(
+            return _generate_mcdc_tcs(
                 primary_req_id, parsed_cond, chunk,
                 tc_counters, sc_counter, review_points
             )
@@ -965,16 +1118,16 @@ def generate_for_chunk(
 
         # RP4: remarks — include notes_context from document (enums, sub-reqs, notes)
         notes_ctx = getattr(chunk, "notes_context", "")
-        remarks = (
-            generate_remarks(sentence, primary_req_id, notes_ctx)
-            if review_points.get("rp4", True)
-            else f"Test basis: SRS requirement {primary_req_id}. Verify before execution."
-        )
+        # Determine input source: ICD if no explicit values in SRS (Req 4)
+        input_source = "ICD" if not any(
+            kw in sentence.lower() for kw in ["is true", "is false", "= true", "= false",
+                                               "value is", "values are", "range", "between"]
+        ) else "SRS"
 
         for scenario_type in scenario_types:
             tc_counters[prefix] += 1
             tc_id = f"TC_{prefix}_{tc_counters[prefix]:03d}"
-            sc_id = f"SC-{sc_counter:03d}"
+            sc_id = f"SC_{sc_counter:03d}"
 
             priority    = assign_priority(chunk.requirement_type, scenario_type, testing_type)
             methodology = assign_methodology(sentence, scenario_type)
@@ -1001,14 +1154,37 @@ def generate_for_chunk(
                 for t in INPUT_TEMPLATES[scenario_type]
             ]
 
-            # Build preconditions
+            # Build preconditions with pre-set input info (Req 9)
             preconditions = [
                 t.format(module=chunk.module, subject=subject_fmt, env=env)
                 for t in PRECONDITION_TEMPLATES[scenario_type]
             ]
+            # Req 9: indicate pre-set input values from requirement + output generation logic
+            if scenario_type == "normal":
+                # Check for predefined values in the requirement text
+                preset_matches = re.findall(
+                    r'(?:is|=|equals?|set\s+to)\s+(True|False|Active|Inactive|\d+(?:\.\d+)?)',
+                    sentence, re.IGNORECASE
+                )
+                if preset_matches:
+                    preset_str = ", ".join(preset_matches)
+                    preconditions.append(
+                        f"Pre-set input values from requirement: {preset_str}"
+                    )
+                    preconditions.append(
+                        f"Output is generated when ALL specified input conditions are met; "
+                        f"changes in any input will directly influence the output state"
+                    )
 
             # Build expected outcome
             expected = EXPECTED_OUTCOME_TEMPLATES[scenario_type].format(action=action_fmt)
+
+            # Generate remarks per scenario (Req 8 — scenario-type-specific)
+            remarks = (
+                generate_remarks(sentence, primary_req_id, notes_ctx, scenario_type, input_source)
+                if review_points.get("rp4", True)
+                else f"• Scenario ({scenario_type.upper()}): Verify before execution."
+            )
 
             # Dependency resolution:
             # - For scenario types: boundary/edge/robustness depend on normal TC
@@ -1024,7 +1200,7 @@ def generate_for_chunk(
                 test_case_id         = tc_id,
                 scenario_id          = sc_id,
                 priority             = priority,
-                objective            = f"Verify {subject} {action} under {scenario_type} conditions",
+                objective            = f"[{scenario_type.upper()}] Verify {subject} {action}",
                 preconditions        = preconditions,
                 test_steps           = steps,
                 inputs               = inputs,
@@ -1057,70 +1233,102 @@ def generate_for_chunk(
 
 # ─── DEDUPLICATION ────────────────────────────────────────────────────────────
 
+def _resequence(test_cases: List[TestCase]) -> List[TestCase]:
+    """
+    Always runs after generation (even when rp5 deduplication is off).
+
+    Rules:
+      1. ONE TC_ID per requirement — increments only when req ID changes.
+      2. SC resets to SC_001 for each new requirement group.
+      3. Depands_On:
+           SC_001 (baseline) -> "None"
+           SC_002+           -> TC_ID_SC-001  (hyphen, references baseline)
+    """
+    prefix_counters: Dict[str, int] = {}
+    req_to_new_tcid: Dict[str, str] = {}
+
+    for tc in test_cases:
+        req_id = tc.traceability_req_id
+        if req_id not in req_to_new_tcid:
+            m = re.match(r'^(TC_[A-Z]+_)', tc.test_case_id)
+            prefix = m.group(1) if m else "TC_UT_"
+            prefix_counters[prefix] = prefix_counters.get(prefix, 0) + 1
+            req_to_new_tcid[req_id] = f"{prefix}{prefix_counters[prefix]:03d}"
+
+    sc_counters_per_req: Dict[str, int] = {}
+    resequenced: List[TestCase] = []
+
+    for tc in test_cases:
+        req_id    = tc.traceability_req_id
+        new_tc_id = req_to_new_tcid[req_id]
+        sc_counters_per_req[req_id] = sc_counters_per_req.get(req_id, 0) + 1
+        new_sc_id = f"SC_{sc_counters_per_req[req_id]:03d}"
+        resequenced.append(tc.model_copy(update={
+            "test_case_id": new_tc_id,
+            "scenario_id":  new_sc_id,
+        }))
+
+    final: List[TestCase] = []
+    seen_req: set = set()
+
+    for tc in resequenced:
+        req_id = tc.traceability_req_id
+        if req_id not in seen_req:
+            seen_req.add(req_id)
+            final.append(tc.model_copy(update={"dependent_test_cases": "None"}))
+        else:
+            dep = f"{tc.test_case_id}_SC-001"
+            final.append(tc.model_copy(update={"dependent_test_cases": dep}))
+
+    return final
+
+
 def deduplicate(test_cases: List[TestCase]) -> Tuple[List[TestCase], int]:
     """
-    Removes duplicate test cases (by objective similarity).
-    EXCEPTION: Decision Table and Condition Coverage TCs are NEVER deduplicated —
-    each scenario is intentionally distinct by design (different input values).
-    After removal, re-sequences:
-    - scenario_id: SC-001, SC-002, SC-003 ... sequential order
-    - test_case_id: TC_UT_001, TC_VD_001 etc. restarted per prefix
-    Spec §4.4: after duplicates removed, Scenario No and TC_ID must be sequential.
-    """
-    PROTECTED_METHODOLOGIES = {"Decision Table Testing", "Condition Coverage Testing"}
+    Removes genuinely duplicate test cases.
 
-    kept, seen, removed = [], [], 0
+    KEY RULE: Test cases for the SAME requirement but DIFFERENT scenario types
+    (normal / boundary / edge / robustness) are NEVER duplicates — they are
+    intentionally distinct scenarios and must ALL be kept.
+
+    A true duplicate is: same requirement_id AND same scenario_type AND
+    near-identical objective (ratio > DEDUP_THRESHOLD).
+
+    Also protected from deduplication:
+    - Decision Table Testing TCs
+    - Condition Coverage Testing TCs
+    """
+    PROTECTED_METHODOLOGIES = {"Decision Table Testing", "Condition Coverage Testing", "MC/DC Testing"}
+
+    # Build a key: (traceability_req_id, scenario_type) → list of seen objectives
+    # Only compare within the same req+scenario_type bucket
+    seen_by_bucket: Dict[str, List[str]] = {}
+
+    kept, removed = [], 0
     for tc in test_cases:
-        # Protect decision table and condition coverage TCs from deduplication
+        # Always keep protected methodologies
         if tc.design_methodology in PROTECTED_METHODOLOGIES:
             kept.append(tc)
-            seen.append(tc.objective)
             continue
+
+        # Bucket key: same requirement + same scenario_type only
+        bucket = f"{tc.traceability_req_id}::{tc.scenario_type}"
+        bucket_seen = seen_by_bucket.setdefault(bucket, [])
 
         is_dup = any(
             SequenceMatcher(None, tc.objective.lower(), s.lower()).ratio() > DEDUP_THRESHOLD
-            for s in seen
+            for s in bucket_seen
         )
         if is_dup:
             removed += 1
             logger.debug(f"Duplicate removed: {tc.test_case_id} — {tc.objective[:60]}")
         else:
-            seen.append(tc.objective)
+            bucket_seen.append(tc.objective)
             kept.append(tc)
 
     logger.info(f"Deduplication: kept {len(kept)}, removed {removed}")
 
-    # Re-sequence scenario IDs and TC IDs after deduplication
-    prefix_counters: Dict[str, int] = {}
-    sc_num = 1
-    old_to_new: Dict[str, str] = {}
-
-    resequenced: List[TestCase] = []
-    for tc in kept:
-        m = re.match(r'^(TC_[A-Z]+_)', tc.test_case_id)
-        prefix = m.group(1) if m else "TC_UT_"
-        prefix_counters[prefix] = prefix_counters.get(prefix, 0) + 1
-        new_tc_id = f"{prefix}{prefix_counters[prefix]:03d}"
-        new_sc_id = f"SC-{sc_num:03d}"
-        old_to_new[tc.test_case_id] = new_tc_id
-        resequenced.append(tc.model_copy(update={
-            "test_case_id": new_tc_id,
-            "scenario_id": new_sc_id,
-        }))
-        sc_num += 1
-
-    # Fix dependency references
-    final: List[TestCase] = []
-    for tc in resequenced:
-        deps = tc.dependent_test_cases
-        for old_id, new_id in old_to_new.items():
-            deps = deps.replace(old_id, new_id)
-        if deps != tc.dependent_test_cases:
-            final.append(tc.model_copy(update={"dependent_test_cases": deps}))
-        else:
-            final.append(tc)
-
-    return final, removed
+    return kept, removed
 
 
 # ─── MAIN ENTRY POINT ─────────────────────────────────────────────────────────
@@ -1206,7 +1414,7 @@ def _generate_merged_tcs(
     for scenario_type in scenario_types:
         tc_counters[prefix] += 1
         tc_id = f"TC_{prefix}_{tc_counters[prefix]:03d}"
-        sc_id = f"SC-{sc_counter:03d}"
+        sc_id = f"SC_{sc_counter:03d}"
 
         # Escape curly braces so .format() does not misread document tokens
         action_fmt  = action.replace("{", "{{").replace("}", "}}") if action else "perform operation"
@@ -1239,12 +1447,12 @@ def _generate_merged_tcs(
         inputs.append(f"Sub-requirements scope: {', '.join(child_ids)}")
 
         remarks_text = (
-            f"MERGED TC — covers {combined_id} as a single unit. "
-            f"Children are simple refinements of the parent; merging reduces "
-            f"redundancy and keeps traceability tight. "
+            f"• MERGED TC — covers {combined_id} as a single unit.\n"
+            f"• Children are simple refinements of the parent; merging reduces redundancy.\n"
         )
         if review_points.get("rp4", True):
-            remarks_text += generate_remarks(parent_content, parent_id)
+            remarks_text += generate_remarks(parent_content, parent_id,
+                                             scenario_type=scenario_type)
 
         results.append(TestCase(
             traceability_req_id  = combined_id,
@@ -1252,9 +1460,9 @@ def _generate_merged_tcs(
             scenario_id          = sc_id,
             priority             = assign_priority(parent_chunk.requirement_type, scenario_type, testing_type),
             objective            = (
-                f"Verify {subject} {action} "
+                f"[{scenario_type.upper()}] Verify {subject} {action} "
                 f"satisfying {parent_id} and sub-requirements "
-                f"{', '.join(child_ids)} under {scenario_type} conditions"
+                f"{', '.join(child_ids)}"
             ),
             preconditions        = [
                 t.format(module=parent_chunk.module, subject=subject_fmt, env=env)
@@ -1343,7 +1551,7 @@ def _generate_separated_tcs(
     all_results.append(TestCase(
         traceability_req_id  = parent_id,
         test_case_id         = int_tc_id,
-        scenario_id          = f"SC-{sc_counter:03d}",
+        scenario_id          = f"SC_{sc_counter:03d}",
         priority             = "P1",
         objective            = (
             f"Verify that {parent_id} and its sub-requirements "
@@ -1464,6 +1672,8 @@ def generate_all(
     else:
         removed = 0
 
+    # Always resequence: shared TC_ID per req, SC resets per req, Depands_On set.
+    # Runs regardless of rp5 so GUI and Excel always show the same TC_IDs.
+    all_test_cases = _resequence(all_test_cases)
+
     return all_test_cases, removed
-
-

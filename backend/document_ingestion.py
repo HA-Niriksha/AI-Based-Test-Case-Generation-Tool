@@ -190,22 +190,79 @@ def extract_remarks_context(content: str, req_id: str) -> str:
 
 # ─── PRIMARY: LINE-BY-LINE REQUIREMENT PARSING ───────────────────────────────
 
+def _clean_module_name(raw: str) -> Optional[str]:
+    """
+    Cleans a heading string into a usable module name.
+
+    Rules (Req 7 + new module spec):
+    - Strip leading section numbers  e.g. "1.1 ", "2.3.4 "
+    - Strip trailing colons / punctuation
+    - Strip [MODULE: ...] wrapper if present
+    - Keep only alphabetical words and spaces (no digits, symbols)
+    - Collapse whitespace; title-case result
+
+    Examples:
+      "1.1 Altitude Direction:"       -> "Altitude Direction"
+      "1.2: Altitude Re-Direction:"   -> "Altitude Re Direction"
+      "[MODULE: 2.1 Flight Control]"  -> "Flight Control"
+      "3. Login Module"               -> "Login Module"
+    """
+    if not raw:
+        return None
+
+    # Unwrap [MODULE: ...] if present
+    m = re.match(r'^\[MODULE:\s*(.+?)\]$', raw.strip(), re.IGNORECASE)
+    if m:
+        raw = m.group(1)
+
+    raw = raw.strip()
+
+    # Remove leading section numbers like "1.", "1.1 ", "2.3.4 ", "1.2:"
+    raw = re.sub(r'^\d+(?:\.\d+)*[:\s]*', '', raw).strip()
+
+    # Remove trailing colons/dots/spaces
+    raw = raw.rstrip(':. ')
+
+    # Keep only alphabetical characters and spaces
+    raw = re.sub(r'[^A-Za-z\s\-]', ' ', raw)
+
+    # Normalise hyphens/dashes to spaces
+    raw = raw.replace('-', ' ')
+
+    # Collapse whitespace and title-case
+    cleaned = ' '.join(raw.split())
+    return cleaned if cleaned else None
+
+
 def parse_requirements_from_text(text: str) -> List[Dict]:
     """
     Reads document line by line.
-    Tracks current module heading (bold markers from file_parser).
-    Each time a line STARTS WITH a requirement ID → new block.
-    Returns: list of { id, all_ids, content, module_heading, notes_context }
+    Tracks the active heading section ([MODULE:] markers injected by file_parser).
+
+    Module assignment logic:
+    - Each [MODULE:] marker sets the current_module for ALL subsequent requirements
+      until the next [MODULE:] marker is seen.
+    - When a requirement starts, the module is captured AT THAT MOMENT (not at flush),
+      so each requirement correctly gets its own heading section.
+    - If multiple requirements fall under the same heading, they all share that module.
+    - If each requirement has its own heading, each gets its individual heading as module.
+
+    This satisfies both cases described in the spec:
+      Case 1: Multiple requirements under one heading → same module
+      Case 2: Each requirement under its own heading → individual module
+
+    Returns: list of { id, all_ids, content, module, notes_context }
     """
     lines           = text.splitlines()
     requirements    = []
     current_id      = None
     current_lines   = []
     current_all_ids = []
-    current_module  = None      # last detected [MODULE:] heading
-    between_notes   = []        # lines between the last req and the current one
+    current_module  = None      # module active when current requirement started
+    pending_module  = None      # module heading seen but not yet assigned to a req
+    between_notes   = []        # lines between reqs (accumulated as notes)
 
-    def _flush(module_override=None):
+    def _flush():
         nonlocal current_id, current_lines, current_all_ids
         if current_id and current_lines:
             content = "\n".join(current_lines).strip()
@@ -214,7 +271,7 @@ def parse_requirements_from_text(text: str) -> List[Dict]:
                 "id":            current_id,
                 "all_ids":       list(dict.fromkeys(current_all_ids)),
                 "content":       content,
-                "module":        module_override or current_module,
+                "module":        current_module,   # module captured when this req started
                 "notes_context": notes,
             })
         current_id      = None
@@ -226,22 +283,39 @@ def parse_requirements_from_text(text: str) -> List[Dict]:
         if not raw:
             continue
 
-        # Detect module heading marker
-        mod = detect_module_from_heading(raw)
-        if mod:
-            current_module = mod
+        # Detect [MODULE: ...] markers (injected by file_parser for every bold heading)
+        mod_raw = None
+        m = _MODULE_MARKER.match(raw)
+        if m:
+            mod_raw = m.group(1).strip()
+
+        if mod_raw is not None:
+            # A new heading has been seen.
+            # Store it as pending — it will be assigned to the NEXT requirement that starts.
+            pending_module = _clean_module_name(mod_raw) or mod_raw
             continue
 
-        # Skip ## heading lines (already captured as [MODULE:])
+        # Skip ## heading lines (already handled via [MODULE:] on the next line)
         if raw.startswith('##'):
             continue
 
         start_ids = _ids_at_line_start(raw)
 
         if start_ids:
-            # Save any between-requirement text as notes of the NEXT requirement
+            # A new requirement starts here.
+            # First flush the previous requirement (still using its own module).
             _flush()
             between_notes = []
+
+            # Apply pending heading module to this new requirement.
+            # If a new heading was seen since the last requirement, use it.
+            # If no new heading since last requirement, inherit the same module
+            # (multiple requirements under one heading).
+            if pending_module is not None:
+                current_module = pending_module
+                pending_module = None          # consumed
+            # else: current_module stays the same → grouped under same heading
+
             extra  = _all_ids_in_line(raw)
             merged = list(dict.fromkeys(start_ids + extra))
             current_id      = start_ids[0]
@@ -254,7 +328,7 @@ def parse_requirements_from_text(text: str) -> List[Dict]:
                     if ref not in current_all_ids:
                         current_all_ids.append(ref)
             else:
-                # Text between requirements: accumulate as context notes
+                # Text before any requirement or between requirements
                 between_notes.append(raw)
 
     _flush()
@@ -350,11 +424,14 @@ def ingest_document(text: str, chunk_size_words: int = 1500) -> List[DocumentChu
     PRIMARY PATH — ID-based (document has requirement IDs):
       Line-by-line detection of ANY ID format.
       One DocumentChunk per requirement, exact ID from the document.
-      Module detected from bold-heading [MODULE:] markers in document structure.
+      Module is derived from document heading structure:
+        - Each requirement captures the heading active when it starts.
+        - If multiple requirements fall under the same heading, they share that module.
+        - If each requirement has its own heading, each gets its own module.
+      Module names are cleaned to alphabetical text only (Req 7).
 
     FALLBACK PATH — sentence-based (no IDs found):
-      One DocumentChunk per sentence.
-      Auto-assigns REQ-001, REQ-002 ... per sentence.
+      One DocumentChunk per sentence; keyword-based module detection.
     """
     if not text or not text.strip():
         return []
@@ -379,10 +456,25 @@ def ingest_document(text: str, chunk_size_words: int = 1500) -> List[DocumentChu
             if primary_id and filtered_content.startswith(primary_id):
                 filtered_content = filtered_content[len(primary_id):].lstrip(" :-.")
 
-            # Module: prefer [MODULE:] heading, then keyword detection
-            doc_module = req.get("module") or detect_module(filtered_content)
+            # Module resolution (new spec):
+            #   1. Use heading-derived module from parse_requirements_from_text
+            #      (already cleaned by _clean_module_name, already handles individual
+            #       and grouped requirements under same heading).
+            #   2. If no heading was found, fall back to keyword detection.
+            #   3. Always ensure the final module is alphabetical-only (Req 7).
+            heading_module = req.get("module")
+            if heading_module:
+                doc_module = heading_module  # already cleaned by _clean_module_name
+            else:
+                # Keyword fallback — extract from content, then clean
+                kw_module = detect_module(filtered_content)
+                doc_module = _clean_module_name(kw_module) or kw_module
 
-            # Gather notes context (between-requirement text, enum definitions, etc.)
+            # Final safety: strip any remaining non-alpha characters (Req 7)
+            doc_module = re.sub(r'[^A-Za-z\s]', ' ', doc_module).strip()
+            doc_module = re.sub(r'\s+', ' ', doc_module) or "General"
+
+            # Gather notes context
             notes_context = req.get("notes_context", "")
             remarks_from_content = extract_remarks_context(raw_content, primary_id)
             full_notes = " | ".join(filter(None, [notes_context, remarks_from_content]))
@@ -411,9 +503,13 @@ def ingest_document(text: str, chunk_size_words: int = 1500) -> List[DocumentChu
             sm = re.match(r'^\d+(?:\.\d+)+$', first)
             if m or sm:
                 s = parts[1].strip()
+        # Clean keyword-detected module (Req 7)
+        kw_mod = detect_module(s)
+        clean_mod = re.sub(r'[^A-Za-z\s]', ' ', kw_mod).strip()
+        clean_mod = re.sub(r'\s+', ' ', clean_mod) or "General"
         result.append(DocumentChunk(
             chunk_index      = i,
-            module           = detect_module(s),
+            module           = clean_mod,
             requirement_type = classify_requirement(s),
             requirement_ids  = [f"REQ-{i + 1:03d}"],
             content          = s,

@@ -66,6 +66,8 @@ class ReviewPoints(BaseModel):
 class GenerateRequest(BaseModel):
     session_id: str
     review_points: ReviewPoints
+    icd_session_id: Optional[str] = None
+    supporting_session_id: Optional[str] = None
 
 
 class GenerateSummary(BaseModel):
